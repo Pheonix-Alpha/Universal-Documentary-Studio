@@ -1,0 +1,52 @@
+# Reference model catalog. ModelRegistry ships with sensible built-in
+# defaults (see models/registry.py); this file documents them and is the
+# place to add new provider entries without touching Python code.
+models:
+  - model_name: mock-image-v1
+    provider: mock
+    supported_tasks: [image_generation]
+    minimum_vram_gb: 0
+    commercial_use: true
+
+  - model_name: sd-turbo-small
+    provider: stability-open
+    license: openrail-m
+    supported_tasks: [image_generation]
+    minimum_vram_gb: 4
+    recommended_vram_gb: 6
+    commercial_use: true
+
+  - model_name: sdxl-base
+    provider: stability-open
+    license: openrail-m
+    supported_tasks: [image_generation]
+    minimum_vram_gb: 8
+    recommended_vram_gb: 12
+    commercial_use: true
+
+  - model_name: mock-tts-v1
+    provider: mock
+    supported_tasks: [tts]
+    minimum_vram_gb: 0
+    commercial_use: true
+
+  - model_name: piper-tts
+    provider: rhasspy-piper
+    license: mit
+    supported_tasks: [tts]
+    minimum_vram_gb: 0
+    commercial_use: true
+
+  - model_name: mock-video-v1
+    provider: mock
+    supported_tasks: [video_generation]
+    minimum_vram_gb: 0
+    commercial_use: true
+
+  - model_name: svd-open
+    provider: stability-open
+    license: openrail-m
+    supported_tasks: [video_generation]
+    minimum_vram_gb: 12
+    recommended_vram_gb: 16
+    commercial_use: true
