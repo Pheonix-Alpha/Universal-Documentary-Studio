@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Model Launcher (Gradio version)
---------------------------------
-A web-based UI for managing local LLM models via Ollama. Works in Google Colab,
-Jupyter, or any environment without a display server (Tkinter needs a display;
-this doesn't).
+Launcher
+--------
+A web-based dev console for Colab/Jupyter (no display server needed).
 
-Features:
-  - Lists available models with their approximate download size
-  - Per-model "Install" button that pulls the model and streams live logs
-  - Per-model "Delete" button (enabled once a model is installed)
-  - Status shows Not Installed / Installing... / Installed
+Three tabs:
+  1. Models    - list of LLM models with size, Install (streams logs), Delete
+  2. Terminal  - run any shell command, streamed output, persistent cwd (cd works)
+  3. Files     - browse a directory, delete files/folders
 
 Requirements:
   - pip install gradio
-  - Ollama installed and on PATH: https://ollama.com
-    In Colab, install it first with:
+  - (Models tab) Ollama installed and on PATH: https://ollama.com
+    In Colab:
       !curl -fsSL https://ollama.com/install.sh | sh
       !nohup ollama serve > ollama.log 2>&1 &
 
@@ -23,14 +20,27 @@ Run:
   python3 launcher.py
 """
 
-import subprocess
+import os
 import shutil
+import subprocess
 import gradio as gr
 
-# ----------------------------------------------------------------------------
-# Model catalog: (display name, ollama tag, approximate download size)
-# Edit this list to add/remove models you want available in the launcher.
-# ----------------------------------------------------------------------------
+# ============================================================================
+# Shared helpers
+# ============================================================================
+
+def human_size(num_bytes):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if num_bytes < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} PB"
+
+
+# ============================================================================
+# Tab 1: Models (Ollama)
+# ============================================================================
+
 MODELS = [
     {"name": "Llama 3.2 1B",     "tag": "llama3.2:1b",     "size": "1.3 GB"},
     {"name": "Llama 3.2 3B",     "tag": "llama3.2:3b",     "size": "2.0 GB"},
@@ -73,7 +83,6 @@ def status_label(tag):
 
 
 def install_model(tag, log_text):
-    """Generator: streams `ollama pull` output live and updates status/buttons."""
     if not OLLAMA_AVAILABLE:
         new_log = (log_text or "") + f"\n[{tag}] Error: 'ollama' command not found.\n"
         yield new_log, status_label(tag), gr.update(interactive=True), gr.update(interactive=False)
@@ -85,10 +94,7 @@ def install_model(tag, log_text):
     try:
         process = subprocess.Popen(
             ["ollama", "pull", tag],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
         for line in process.stdout:
             log_text += line
@@ -125,47 +131,199 @@ def delete_model(tag, log_text):
         return log_text, "🟢 Installed", gr.update(interactive=False), gr.update(interactive=True)
 
 
-def clear_logs():
+def clear_model_logs():
     return ""
 
 
-with gr.Blocks(title="Model Launcher") as demo:
-    gr.Markdown("# 🚀 Model Launcher")
-    gr.Markdown(ollama_missing_notice())
+# ============================================================================
+# Tab 2: Terminal (arbitrary shell commands, streamed, persistent cwd)
+# ============================================================================
 
-    log_box = gr.Textbox(
-        label="Installation Logs",
-        lines=14,
-        max_lines=14,
-        interactive=False,
-        autoscroll=True,
-    )
-    clear_btn = gr.Button("Clear logs", size="sm")
-    clear_btn.click(fn=clear_logs, outputs=log_box)
+def run_command(cmd, cwd, term_log):
+    """Generator: streams shell command output. Handles 'cd' locally to persist cwd."""
+    cmd = (cmd or "").strip()
+    term_log = term_log or ""
+    if not cmd:
+        yield term_log, cwd, cwd
+        return
 
-    gr.Markdown("---")
+    term_log += f"\n{cwd}$ {cmd}\n"
 
-    for model in MODELS:
-        tag = model["tag"]
-        with gr.Row(equal_height=True):
-            gr.Markdown(f"**{model['name']}**", elem_id=f"name-{tag}")
-            gr.Markdown(model["size"])
-            status_box = gr.Markdown(status_label(tag))
-            install_btn = gr.Button("Install", size="sm", interactive=not is_installed(tag))
-            delete_btn = gr.Button("Delete", size="sm", interactive=is_installed(tag))
+    # Handle 'cd' specially since each subprocess call is a fresh shell
+    if cmd == "cd" or cmd.startswith("cd "):
+        target = cmd[2:].strip() or os.path.expanduser("~")
+        new_path = os.path.normpath(os.path.join(cwd, os.path.expanduser(target)))
+        if os.path.isdir(new_path):
+            term_log += f"(changed directory to {new_path})\n"
+            yield term_log, new_path, new_path
+        else:
+            term_log += f"cd: no such directory: {target}\n"
+            yield term_log, cwd, cwd
+        return
 
-        install_btn.click(
-            fn=install_model,
-            inputs=[gr.State(tag), log_box],
-            outputs=[log_box, status_box, install_btn, delete_btn],
+    try:
+        process = subprocess.Popen(
+            cmd, shell=True, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
-        delete_btn.click(
-            fn=delete_model,
-            inputs=[gr.State(tag), log_box],
-            outputs=[log_box, status_box, install_btn, delete_btn],
-        )
+        for line in process.stdout:
+            term_log += line
+            yield term_log, cwd, cwd
+        process.wait()
+        term_log += f"[exit code {process.returncode}]\n"
+        yield term_log, cwd, cwd
+    except Exception as e:
+        term_log += f"Error: {e}\n"
+        yield term_log, cwd, cwd
+
+
+def clear_terminal_log():
+    return ""
+
+
+# ============================================================================
+# Tab 3: Files (browse + delete)
+# ============================================================================
+
+def list_directory(path):
+    path = path or "."
+    path = os.path.expanduser(path)
+    if not os.path.isdir(path):
+        return [["Error", f"Not a directory: {path}", ""]], path
+
+    rows = []
+    try:
+        entries = sorted(os.listdir(path), key=lambda e: (not os.path.isdir(os.path.join(path, e)), e.lower()))
+    except Exception as e:
+        return [["Error", str(e), ""]], path
+
+    for entry in entries:
+        full = os.path.join(path, entry)
+        try:
+            if os.path.isdir(full):
+                rows.append([entry + "/", "folder", ""])
+            else:
+                size = os.path.getsize(full)
+                rows.append([entry, "file", human_size(size)])
+        except Exception:
+            rows.append([entry, "?", ""])
+
+    if not rows:
+        rows = [["(empty directory)", "", ""]]
+    return rows, path
+
+
+def delete_path(target_path):
+    target_path = os.path.expanduser((target_path or "").strip())
+    if not target_path:
+        return "No path given."
+    if not os.path.exists(target_path):
+        return f"Path does not exist: {target_path}"
+    try:
+        if os.path.isdir(target_path):
+            shutil.rmtree(target_path)
+            return f"Deleted directory: {target_path}"
+        else:
+            os.remove(target_path)
+            return f"Deleted file: {target_path}"
+    except Exception as e:
+        return f"Error deleting {target_path}: {e}"
+
+
+# ============================================================================
+# UI
+# ============================================================================
+
+with gr.Blocks(title="Launcher") as demo:
+    gr.Markdown("# 🚀 Launcher")
+
+    with gr.Tabs():
+        # ---------------- Models tab ----------------
+        with gr.Tab("Models"):
+            gr.Markdown(ollama_missing_notice())
+            model_log = gr.Textbox(label="Installation Logs", lines=12, max_lines=12,
+                                    interactive=False, autoscroll=True)
+            clear_models_btn = gr.Button("Clear logs", size="sm")
+            clear_models_btn.click(fn=clear_model_logs, outputs=model_log)
+
+            gr.Markdown("---")
+
+            for model in MODELS:
+                tag = model["tag"]
+                with gr.Row(equal_height=True):
+                    gr.Markdown(f"**{model['name']}**")
+                    gr.Markdown(model["size"])
+                    status_box = gr.Markdown(status_label(tag))
+                    install_btn = gr.Button("Install", size="sm", interactive=not is_installed(tag))
+                    delete_btn = gr.Button("Delete", size="sm", interactive=is_installed(tag))
+
+                install_btn.click(
+                    fn=install_model,
+                    inputs=[gr.State(tag), model_log],
+                    outputs=[model_log, status_box, install_btn, delete_btn],
+                )
+                delete_btn.click(
+                    fn=delete_model,
+                    inputs=[gr.State(tag), model_log],
+                    outputs=[model_log, status_box, install_btn, delete_btn],
+                )
+
+        # ---------------- Terminal tab ----------------
+        with gr.Tab("Terminal"):
+            gr.Markdown(
+                "Run any shell command — `pip install ...`, `apt-get install ...`, "
+                "`git clone ...`, `rm ...`, `cd ...`, etc. Runs with your notebook's permissions."
+            )
+            cwd_state = gr.State(os.getcwd())
+            cwd_display = gr.Textbox(label="Working directory", value=os.getcwd(), interactive=False)
+            term_log = gr.Textbox(label="Terminal", lines=18, max_lines=18,
+                                   interactive=False, autoscroll=True, elem_id="term-log")
+            with gr.Row():
+                cmd_input = gr.Textbox(label="Command", placeholder="pip install numpy", scale=5)
+                run_btn = gr.Button("Run", variant="primary", scale=1)
+            clear_term_btn = gr.Button("Clear terminal", size="sm")
+
+            run_btn.click(
+                fn=run_command,
+                inputs=[cmd_input, cwd_state, term_log],
+                outputs=[term_log, cwd_state, cwd_display],
+            ).then(fn=lambda: "", outputs=cmd_input)
+
+            cmd_input.submit(
+                fn=run_command,
+                inputs=[cmd_input, cwd_state, term_log],
+                outputs=[term_log, cwd_state, cwd_display],
+            ).then(fn=lambda: "", outputs=cmd_input)
+
+            clear_term_btn.click(fn=clear_terminal_log, outputs=term_log)
+
+        # ---------------- Files tab ----------------
+        with gr.Tab("Files"):
+            gr.Markdown("Browse a directory and delete files or folders.")
+            with gr.Row():
+                dir_input = gr.Textbox(label="Directory", value=os.getcwd(), scale=4)
+                list_btn = gr.Button("List", scale=1)
+
+            file_table = gr.Dataframe(
+                headers=["Name", "Type", "Size"],
+                datatype=["str", "str", "str"],
+                interactive=False,
+                wrap=True,
+            )
+
+            list_btn.click(fn=list_directory, inputs=dir_input, outputs=[file_table, dir_input])
+            dir_input.submit(fn=list_directory, inputs=dir_input, outputs=[file_table, dir_input])
+
+            gr.Markdown("---")
+            with gr.Row():
+                delete_input = gr.Textbox(
+                    label="Path to delete (file or folder, full or relative to above)", scale=4
+                )
+                delete_btn = gr.Button("Delete", variant="stop", scale=1)
+            delete_result = gr.Textbox(label="Result", interactive=False)
+
+            delete_btn.click(fn=delete_path, inputs=delete_input, outputs=delete_result)
 
 
 if __name__ == "__main__":
-    # share=True gives you a public link, which is what you need in Colab.
     demo.launch(share=True)
