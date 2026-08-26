@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-Model Launcher
---------------
-A simple desktop GUI (Tkinter) for managing local LLM models via Ollama.
+Model Launcher (Gradio version)
+--------------------------------
+A web-based UI for managing local LLM models via Ollama. Works in Google Colab,
+Jupyter, or any environment without a display server (Tkinter needs a display;
+this doesn't).
 
 Features:
   - Lists available models with their approximate download size
   - Per-model "Install" button that pulls the model and streams live logs
-  - Per-model "Delete" button (enabled once a model is installed) to remove it
-  - Status column shows Not Installed / Installing... / Installed
+  - Per-model "Delete" button (enabled once a model is installed)
+  - Status shows Not Installed / Installing... / Installed
 
 Requirements:
-  - Ollama must be installed and on PATH: https://ollama.com
-  - Python 3.8+
+  - pip install gradio
+  - Ollama installed and on PATH: https://ollama.com
+    In Colab, install it first with:
+      !curl -fsSL https://ollama.com/install.sh | sh
+      !nohup ollama serve > ollama.log 2>&1 &
 
 Run:
   python3 launcher.py
 """
 
 import subprocess
-import threading
-import queue
 import shutil
-import tkinter as tk
-from tkinter import ttk, messagebox
+import gradio as gr
 
 # ----------------------------------------------------------------------------
 # Model catalog: (display name, ollama tag, approximate download size)
@@ -42,244 +44,128 @@ MODELS = [
     {"name": "DeepSeek R1 7B",   "tag": "deepseek-r1:7b",  "size": "4.7 GB"},
 ]
 
+OLLAMA_AVAILABLE = shutil.which("ollama") is not None
 
-class ModelLauncher(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Model Launcher")
-        self.geometry("880x560")
-        self.minsize(760, 480)
 
-        self.log_queue = queue.Queue()
-        self.row_widgets = {}   # tag -> dict of widgets for that row
-        self.installing = set()  # tags currently installing
+def ollama_missing_notice():
+    if OLLAMA_AVAILABLE:
+        return ""
+    return (
+        "⚠️ **Ollama not found on PATH.** Install it first, e.g. in Colab:\n\n"
+        "```\n!curl -fsSL https://ollama.com/install.sh | sh\n"
+        "!nohup ollama serve > ollama.log 2>&1 &\n```"
+    )
 
-        self._check_ollama()
-        self._build_ui()
-        self._refresh_installed_status()
-        self.after(100, self._poll_log_queue)
 
-    # ------------------------------------------------------------------
-    # Setup
-    # ------------------------------------------------------------------
-    def _check_ollama(self):
-        if shutil.which("ollama") is None:
-            messagebox.showwarning(
-                "Ollama not found",
-                "The 'ollama' command was not found on your PATH.\n\n"
-                "Install it from https://ollama.com to use this launcher.\n"
-                "The UI will still open, but installs/deletes will fail.",
-            )
+def is_installed(tag):
+    if not OLLAMA_AVAILABLE:
+        return False
+    try:
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10)
+        base_name = tag.split(":")[0]
+        return tag in result.stdout or base_name in result.stdout
+    except Exception:
+        return False
 
-    def _build_ui(self):
-        # Header
-        header = ttk.Frame(self, padding=(12, 10))
-        header.pack(fill="x")
-        ttk.Label(header, text="Model Launcher", font=("Segoe UI", 16, "bold")).pack(side="left")
-        ttk.Button(header, text="Refresh status", command=self._refresh_installed_status).pack(side="right")
 
-        # Table header
-        cols = ("Model", "Size", "Status")
-        table_header = ttk.Frame(self, padding=(12, 0))
-        table_header.pack(fill="x")
-        widths = (260, 90, 130)
-        for text, w in zip(cols, widths):
-            ttk.Label(table_header, text=text, font=("Segoe UI", 10, "bold"), width=w // 8).pack(side="left")
+def status_label(tag):
+    return "🟢 Installed" if is_installed(tag) else "⚪ Not Installed"
 
-        # Scrollable model list
-        list_container = ttk.Frame(self, padding=(12, 4))
-        list_container.pack(fill="both", expand=False)
 
-        canvas = tk.Canvas(list_container, height=230, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
-        self.rows_frame = ttk.Frame(canvas)
+def install_model(tag, log_text):
+    """Generator: streams `ollama pull` output live and updates status/buttons."""
+    if not OLLAMA_AVAILABLE:
+        new_log = (log_text or "") + f"\n[{tag}] Error: 'ollama' command not found.\n"
+        yield new_log, status_label(tag), gr.update(interactive=True), gr.update(interactive=False)
+        return
 
-        self.rows_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    log_text = (log_text or "") + f"\n$ ollama pull {tag}\n"
+    yield log_text, "🟡 Installing...", gr.update(interactive=False), gr.update(interactive=False)
+
+    try:
+        process = subprocess.Popen(
+            ["ollama", "pull", tag],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        for line in process.stdout:
+            log_text += line
+            yield log_text, "🟡 Installing...", gr.update(interactive=False), gr.update(interactive=False)
+        process.wait()
+        success = process.returncode == 0
+    except Exception as e:
+        log_text += f"Error: {e}\n"
+        success = False
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+    if success:
+        log_text += f"[{tag}] Install complete.\n"
+        yield log_text, "🟢 Installed", gr.update(interactive=False), gr.update(interactive=True)
+    else:
+        log_text += f"[{tag}] Install failed.\n"
+        yield log_text, "⚪ Not Installed", gr.update(interactive=True), gr.update(interactive=False)
 
-        for model in MODELS:
-            self._add_model_row(model)
 
-        # Log panel
-        log_label = ttk.Frame(self, padding=(12, 8, 12, 0))
-        log_label.pack(fill="x")
-        ttk.Label(log_label, text="Installation Logs", font=("Segoe UI", 11, "bold")).pack(side="left")
-        ttk.Button(log_label, text="Clear logs", command=self._clear_logs).pack(side="right")
+def delete_model(tag, log_text):
+    log_text = (log_text or "") + f"\n$ ollama rm {tag}\n"
+    try:
+        result = subprocess.run(["ollama", "rm", tag], capture_output=True, text=True, timeout=30)
+        log_text += (result.stdout or "") + (result.stderr or "")
+        success = result.returncode == 0
+    except Exception as e:
+        log_text += f"Error: {e}\n"
+        success = False
 
-        log_frame = ttk.Frame(self, padding=12)
-        log_frame.pack(fill="both", expand=True)
+    if success:
+        log_text += f"[{tag}] Delete complete.\n"
+        return log_text, "⚪ Not Installed", gr.update(interactive=True), gr.update(interactive=False)
+    else:
+        log_text += f"[{tag}] Delete failed.\n"
+        return log_text, "🟢 Installed", gr.update(interactive=False), gr.update(interactive=True)
 
-        self.log_text = tk.Text(log_frame, bg="#111318", fg="#d7e0ea", insertbackground="white",
-                                 wrap="word", font=("Consolas", 10), state="disabled")
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        log_scroll.pack(side="right", fill="y")
 
-    def _add_model_row(self, model):
+def clear_logs():
+    return ""
+
+
+with gr.Blocks(title="Model Launcher") as demo:
+    gr.Markdown("# 🚀 Model Launcher")
+    gr.Markdown(ollama_missing_notice())
+
+    log_box = gr.Textbox(
+        label="Installation Logs",
+        lines=14,
+        max_lines=14,
+        interactive=False,
+        autoscroll=True,
+    )
+    clear_btn = gr.Button("Clear logs", size="sm")
+    clear_btn.click(fn=clear_logs, outputs=log_box)
+
+    gr.Markdown("---")
+
+    for model in MODELS:
         tag = model["tag"]
-        row = ttk.Frame(self.rows_frame, padding=(0, 4))
-        row.pack(fill="x")
+        with gr.Row(equal_height=True):
+            gr.Markdown(f"**{model['name']}**", elem_id=f"name-{tag}")
+            gr.Markdown(model["size"])
+            status_box = gr.Markdown(status_label(tag))
+            install_btn = gr.Button("Install", size="sm", interactive=not is_installed(tag))
+            delete_btn = gr.Button("Delete", size="sm", interactive=is_installed(tag))
 
-        name_lbl = ttk.Label(row, text=model["name"], width=32)
-        name_lbl.pack(side="left")
-
-        size_lbl = ttk.Label(row, text=model["size"], width=11)
-        size_lbl.pack(side="left")
-
-        status_lbl = ttk.Label(row, text="Checking...", width=16, foreground="#888888")
-        status_lbl.pack(side="left")
-
-        install_btn = ttk.Button(row, text="Install", command=lambda: self._start_install(tag))
-        install_btn.pack(side="left", padx=(4, 4))
-
-        delete_btn = ttk.Button(row, text="Delete", command=lambda: self._start_delete(tag),
-                                 state="disabled")
-        delete_btn.pack(side="left")
-
-        self.row_widgets[tag] = {
-            "status": status_lbl,
-            "install_btn": install_btn,
-            "delete_btn": delete_btn,
-        }
-
-    # ------------------------------------------------------------------
-    # Status checking
-    # ------------------------------------------------------------------
-    def _refresh_installed_status(self):
-        if shutil.which("ollama") is None:
-            for tag, widgets in self.row_widgets.items():
-                widgets["status"].config(text="Ollama missing", foreground="#c0392b")
-            return
-
-        try:
-            result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10)
-            installed_output = result.stdout
-        except Exception:
-            installed_output = ""
-
-        for tag, widgets in self.row_widgets.items():
-            if tag in self.installing:
-                continue  # don't clobber "Installing..." status
-            base_name = tag.split(":")[0]
-            is_installed = tag in installed_output or base_name in installed_output
-            self._set_row_state(tag, "Installed" if is_installed else "Not Installed")
-
-    def _set_row_state(self, tag, status_text):
-        widgets = self.row_widgets[tag]
-        widgets["status"].config(text=status_text)
-        if status_text == "Installed":
-            widgets["status"].config(foreground="#2e7d32")
-            widgets["install_btn"].config(state="disabled")
-            widgets["delete_btn"].config(state="normal")
-        elif status_text == "Installing...":
-            widgets["status"].config(foreground="#e08e00")
-            widgets["install_btn"].config(state="disabled")
-            widgets["delete_btn"].config(state="disabled")
-        else:  # Not Installed
-            widgets["status"].config(foreground="#888888")
-            widgets["install_btn"].config(state="normal")
-            widgets["delete_btn"].config(state="disabled")
-
-    # ------------------------------------------------------------------
-    # Install
-    # ------------------------------------------------------------------
-    def _start_install(self, tag):
-        if tag in self.installing:
-            return
-        if shutil.which("ollama") is None:
-            messagebox.showerror("Ollama not found", "Install Ollama first: https://ollama.com")
-            return
-
-        self.installing.add(tag)
-        self._set_row_state(tag, "Installing...")
-        self._log(f"\n$ ollama pull {tag}\n")
-
-        thread = threading.Thread(target=self._run_install, args=(tag,), daemon=True)
-        thread.start()
-
-    def _run_install(self, tag):
-        try:
-            process = subprocess.Popen(
-                ["ollama", "pull", tag],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            for line in process.stdout:
-                self.log_queue.put((tag, line))
-            process.wait()
-            success = process.returncode == 0
-        except Exception as e:
-            self.log_queue.put((tag, f"Error: {e}\n"))
-            success = False
-
-        self.log_queue.put((tag, "__DONE__:INSTALL:" + ("OK" if success else "FAIL")))
-
-    # ------------------------------------------------------------------
-    # Delete
-    # ------------------------------------------------------------------
-    def _start_delete(self, tag):
-        if not messagebox.askyesno("Confirm delete", f"Delete model '{tag}' from disk?"):
-            return
-        self._log(f"\n$ ollama rm {tag}\n")
-        thread = threading.Thread(target=self._run_delete, args=(tag,), daemon=True)
-        thread.start()
-
-    def _run_delete(self, tag):
-        try:
-            result = subprocess.run(["ollama", "rm", tag], capture_output=True, text=True, timeout=30)
-            output = (result.stdout or "") + (result.stderr or "")
-            success = result.returncode == 0
-        except Exception as e:
-            output = f"Error: {e}\n"
-            success = False
-
-        self.log_queue.put((tag, output))
-        self.log_queue.put((tag, "__DONE__:DELETE:" + ("OK" if success else "FAIL")))
-
-    # ------------------------------------------------------------------
-    # Logging / queue polling (thread-safe UI updates)
-    # ------------------------------------------------------------------
-    def _poll_log_queue(self):
-        try:
-            while True:
-                tag, line = self.log_queue.get_nowait()
-
-                if line.startswith("__DONE__:INSTALL:"):
-                    ok = line.endswith("OK")
-                    self.installing.discard(tag)
-                    self._set_row_state(tag, "Installed" if ok else "Not Installed")
-                    self._log(f"[{tag}] {'Install complete.' if ok else 'Install failed.'}\n")
-                elif line.startswith("__DONE__:DELETE:"):
-                    ok = line.endswith("OK")
-                    self._set_row_state(tag, "Not Installed" if ok else "Installed")
-                    self._log(f"[{tag}] {'Delete complete.' if ok else 'Delete failed.'}\n")
-                else:
-                    self._log(f"[{tag}] {line}")
-        except queue.Empty:
-            pass
-        self.after(100, self._poll_log_queue)
-
-    def _log(self, text):
-        self.log_text.config(state="normal")
-        self.log_text.insert("end", text)
-        self.log_text.see("end")
-        self.log_text.config(state="disabled")
-
-    def _clear_logs(self):
-        self.log_text.config(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.config(state="disabled")
+        install_btn.click(
+            fn=install_model,
+            inputs=[gr.State(tag), log_box],
+            outputs=[log_box, status_box, install_btn, delete_btn],
+        )
+        delete_btn.click(
+            fn=delete_model,
+            inputs=[gr.State(tag), log_box],
+            outputs=[log_box, status_box, install_btn, delete_btn],
+        )
 
 
 if __name__ == "__main__":
-    app = ModelLauncher()
-    app.mainloop()
+    # share=True gives you a public link, which is what you need in Colab.
+    demo.launch(share=True)
