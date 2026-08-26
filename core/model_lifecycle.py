@@ -24,6 +24,7 @@ implementation so the pipeline can always complete -- see spec sections
 """
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from enum import Enum
@@ -110,12 +111,25 @@ class ModelLifecycleManager:
         runtime_dir: str = "uds_runtime",
         mock_mode: bool = True,
         status_callback: Optional[StatusCallback] = None,
+        weights_cache_root: str | None = None,
     ):
         self.model_registry = model_registry
         self.resource_manager = resource_manager
         self.runtime_dir = Path(runtime_dir)
         self.mock_mode = mock_mode
         self.status_callback = status_callback
+
+        # Downloaded model weights are multi-GB and expensive to fetch --
+        # launcher.py pre-caches them to persistent Google Drive storage
+        # and points HF_HOME there specifically so a run never re-pays the
+        # download cost. Weights must therefore survive across every
+        # acquire()/release() cycle; they live in a *separate*, persistent
+        # location from runtime_dir (which is fine to treat as scratch
+        # space). Defaults to HF_HOME when launcher.py has set it, so real
+        # Colab runs are fast by default with zero extra wiring.
+        self.weights_cache_root = Path(
+            weights_cache_root or os.environ.get("HF_HOME") or (self.runtime_dir / "weights_cache")
+        )
 
     # ------------------------------------------------------------------
 
@@ -218,15 +232,19 @@ class ModelLifecycleManager:
         except Exception:  # noqa: BLE001 - unload must never raise into the caller
             logger.exception("Error unloading model %s", loaded.capability.model_name)
 
+        # NOTE: we deliberately do NOT delete the model's weights directory
+        # here. `_model_workdir` points into `weights_cache_root` (the
+        # persistent, HF_HOME-backed cache), not scratch space -- wiping it
+        # on every release would silently defeat launcher.py's pre-caching
+        # and force a full multi-GB re-download on the next acquire().
+        # "CLEANING" now just means "unloaded the weights from
+        # GPU/RAM" (done above via generator.unload()); the files on disk
+        # are meant to be reused.
         self._emit(loaded.task, ModelLifecycleStatus.CLEANING, model_name=loaded.capability.model_name)
-        if loaded.capability.provider != "mock":
-            workdir = self._model_workdir(loaded.task, loaded.capability)
-            shutil.rmtree(workdir, ignore_errors=True)
-
         self._emit(loaded.task, ModelLifecycleStatus.COMPLETED, model_name=loaded.capability.model_name)
 
     def _model_workdir(self, task: ModelTask, capability: ModelCapability) -> Path:
-        return self.runtime_dir / "active_model" / task.value / capability.model_name
+        return self.weights_cache_root / task.value / capability.model_name
 
     @staticmethod
     def _mock_capability(task: ModelTask) -> ModelCapability:

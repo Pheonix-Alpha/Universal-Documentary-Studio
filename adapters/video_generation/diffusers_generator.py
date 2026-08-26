@@ -17,6 +17,31 @@ from core.logging import get_logger
 
 logger = get_logger(__name__)
 
+# SVD (img2vid) is trained/benchmarked at 1024x576. Feeding it a much larger
+# source frame (this app's 1920x1080 long-form canvas) sharply increases
+# memory for every one of its output frames, which is the actual cause of
+# CUDA OOMs here -- independent of the registry's declared VRAM requirement,
+# which has no notion of requested resolution. The rendering stage
+# (engines/rendering/ffmpeg_renderer.py) already rescales every clip to the
+# final composition resolution via its own ffmpeg `scale=` filter, so the
+# clip returned here doesn't need to already be full-resolution.
+_MAX_GENERATION_DIM = 1024
+_DIM_MULTIPLE = 8
+
+
+def _clamp_generation_size(width: int, height: int, max_dim: int = _MAX_GENERATION_DIM) -> tuple[int, int]:
+    """Same rationale/behavior as the image generator's clamp: fit within
+    max_dim on the long edge, preserve aspect ratio, round to a multiple of
+    8, never scale up."""
+    longest = max(width, height)
+    scale = 1.0 if longest <= max_dim else max_dim / longest
+
+    def _round(v: float) -> int:
+        v = int(v * scale)
+        return max(_DIM_MULTIPLE, (v // _DIM_MULTIPLE) * _DIM_MULTIPLE)
+
+    return _round(width), _round(height)
+
 
 class DiffusersVideoGenerator(VideoGenerator):
     """Loads a HuggingFace Stable Video Diffusion (img2vid) pipeline on demand.
@@ -64,6 +89,14 @@ class DiffusersVideoGenerator(VideoGenerator):
             self._pipe = StableVideoDiffusionPipeline.from_pretrained(hf_repo_id, **load_kwargs)
         if self.use_cuda:
             self._pipe = self._pipe.to("cuda")
+            # Extra VRAM safety margin on top of the resolution clamp below.
+            for method_name in ("enable_vae_slicing", "enable_vae_tiling"):
+                method = getattr(self._pipe, method_name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:  # noqa: BLE001 - best-effort, not all pipes support both
+                        logger.debug("%s unavailable for %s", method_name, self.model_name)
 
     def generate(self, request: VideoGenerationRequest, output_path: str) -> VideoGenerationResult:
         from diffusers.utils import export_to_video, load_image
@@ -76,8 +109,19 @@ class DiffusersVideoGenerator(VideoGenerator):
                 output_path=source_image,
             )
 
-        image = load_image(source_image).resize((request.width, request.height))
-        frames = self._pipe(image, decode_chunk_size=8).frames[0]
+        gen_width, gen_height = _clamp_generation_size(request.width, request.height)
+        if (gen_width, gen_height) != (request.width, request.height):
+            logger.info(
+                "Scene requested %dx%d; generating video at %dx%d (model-native cap) to stay within VRAM -- "
+                "the render stage upscales to the final resolution.",
+                request.width, request.height, gen_width, gen_height,
+            )
+
+        image = load_image(source_image).resize((gen_width, gen_height))
+        # decode_chunk_size trades speed for VAE-decode memory; 2-4 is a
+        # safer default than 8 now that resolution is already clamped, and
+        # matters most on 12-16GB cards.
+        frames = self._pipe(image, decode_chunk_size=4).frames[0]
 
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +131,11 @@ class DiffusersVideoGenerator(VideoGenerator):
             file_path=str(out_path),
             model_name=self.model_name,
             provider=self.provider,
-            metadata={"prompt": request.prompt, "source_image": source_image, "hf_repo_id": self.hf_repo_id},
+            metadata={
+                "prompt": request.prompt, "source_image": source_image, "hf_repo_id": self.hf_repo_id,
+                "requested_width": request.width, "requested_height": request.height,
+                "generated_width": gen_width, "generated_height": gen_height,
+            },
         )
 
     def unload(self) -> None:

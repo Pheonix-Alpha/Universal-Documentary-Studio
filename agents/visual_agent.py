@@ -105,18 +105,32 @@ class VisualAgent:
 
     def release_models(self) -> None:
         """Explicitly unload + clean up any models acquired by this agent."""
-        if self._image_model is not None:
-            self._image_model.release()
-            self._image_model = None
-        if self._video_model is not None:
-            self._video_model.release()
-            self._video_model = None
+        self._release_image_model()
+        self._release_video_model()
 
     # ------------------------------------------------------------------
     # Lazy model acquisition (cached for the duration of one run()/regen)
     # ------------------------------------------------------------------
 
+    def _release_image_model(self) -> None:
+        if self._image_model is not None:
+            self._image_model.release()
+            self._image_model = None
+
+    def _release_video_model(self) -> None:
+        if self._video_model is not None:
+            self._video_model.release()
+            self._video_model = None
+
     def _get_image_generator(self):
+        # Image and video models are each large enough (e.g. SDXL ~7GB +
+        # SVD ~9GB fp16) that holding both resident on GPU at once can
+        # exceed VRAM on cards like a T4 (14.56GB total). No single scene
+        # ever needs both simultaneously -- video is attempted, and only
+        # on failure/absence does a scene fall back to image generation --
+        # so release the other model type before loading this one instead
+        # of letting both accumulate across the run.
+        self._release_video_model()
         if self._image_model is None:
             self._image_model = self.model_lifecycle.acquire(
                 task=ModelTask.IMAGE_GENERATION,
@@ -131,6 +145,7 @@ class VisualAgent:
         return self._image_model.generator
 
     def _get_video_generator(self):
+        self._release_image_model()
         if self._video_model is None:
             self._video_model = self.model_lifecycle.acquire(
                 task=ModelTask.VIDEO_GENERATION,

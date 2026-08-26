@@ -17,6 +17,39 @@ from core.logging import get_logger
 
 logger = get_logger(__name__)
 
+# SDXL is trained/benchmarked around ~1024x1024 (1,048,576 px). Generating
+# directly at much larger targets (e.g. this app's 1920x1080 long-form
+# canvas, ~2,073,600 px) roughly doubles attention/activation memory versus
+# native resolution and is what actually exhausts VRAM on cards like a T4 --
+# independent of how much VRAM the model's registry entry declares, since
+# that figure is a per-model constant that has no idea what resolution a
+# caller will ask for. Every downstream consumer of this image
+# (engines/animation/ken_burns.py, engines/rendering/ffmpeg_renderer.py)
+# already scales its input to the final target resolution via its own
+# ffmpeg `scale=` filter, so there is no need to generate at the caller's
+# exact requested size -- we generate at a safe, model-native size and let
+# those later ffmpeg stages do the upscale.
+_MAX_GENERATION_DIM = 1024
+_DIM_MULTIPLE = 8
+
+
+def _clamp_generation_size(width: int, height: int, max_dim: int = _MAX_GENERATION_DIM) -> tuple[int, int]:
+    """Scale (width, height) down to fit within max_dim on the long edge,
+    preserving aspect ratio, rounded to a multiple of 8 (required by SDXL's
+    U-Net). Never scales up -- if the request is already small, it's left
+    alone."""
+    longest = max(width, height)
+    if longest <= max_dim:
+        scale = 1.0
+    else:
+        scale = max_dim / longest
+
+    def _round(v: float) -> int:
+        v = int(v * scale)
+        return max(_DIM_MULTIPLE, (v // _DIM_MULTIPLE) * _DIM_MULTIPLE)
+
+    return _round(width), _round(height)
+
 
 class DiffusersImageGenerator(ImageGenerator):
     """Loads a HuggingFace `diffusers` text-to-image pipeline on demand."""
@@ -60,6 +93,17 @@ class DiffusersImageGenerator(ImageGenerator):
             self._pipe = AutoPipelineForText2Image.from_pretrained(hf_repo_id, **load_kwargs)
         if self.use_cuda:
             self._pipe = self._pipe.to("cuda")
+            # Extra VRAM safety margin on top of the resolution clamp below
+            # -- cheap (small/no measurable quality cost, modest speed
+            # cost) and makes this robust even on tighter cards than a T4.
+            try:
+                self._pipe.enable_attention_slicing()
+            except Exception:  # noqa: BLE001 - not all pipelines support this
+                logger.debug("enable_attention_slicing unavailable for %s", self.model_name)
+            try:
+                self._pipe.enable_vae_slicing()
+            except Exception:  # noqa: BLE001
+                logger.debug("enable_vae_slicing unavailable for %s", self.model_name)
 
     def generate(self, request: ImageGenerationRequest, output_path: str) -> ImageGenerationResult:
         generator = None
@@ -67,11 +111,19 @@ class DiffusersImageGenerator(ImageGenerator):
             device = "cuda" if self.use_cuda else "cpu"
             generator = self._torch.Generator(device=device).manual_seed(request.seed)
 
+        gen_width, gen_height = _clamp_generation_size(request.width, request.height)
+        if (gen_width, gen_height) != (request.width, request.height):
+            logger.info(
+                "Scene requested %dx%d; generating at %dx%d (model-native cap) to stay within VRAM -- "
+                "downstream ffmpeg stages upscale to the final resolution.",
+                request.width, request.height, gen_width, gen_height,
+            )
+
         result = self._pipe(
             prompt=request.prompt,
             negative_prompt=request.negative_prompt or None,
-            width=request.width,
-            height=request.height,
+            width=gen_width,
+            height=gen_height,
             generator=generator,
         )
         image = result.images[0]
@@ -85,7 +137,11 @@ class DiffusersImageGenerator(ImageGenerator):
             model_name=self.model_name,
             provider=self.provider,
             seed=request.seed,
-            metadata={"prompt": request.prompt, "hf_repo_id": self.hf_repo_id, "width": request.width, "height": request.height},
+            metadata={
+                "prompt": request.prompt, "hf_repo_id": self.hf_repo_id,
+                "requested_width": request.width, "requested_height": request.height,
+                "generated_width": gen_width, "generated_height": gen_height,
+            },
         )
 
     def unload(self) -> None:
