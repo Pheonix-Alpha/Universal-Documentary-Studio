@@ -9,12 +9,16 @@ Three tabs:
   2. Terminal  - run any shell command, streamed output, persistent cwd (cd works)
   3. Files     - browse a directory, delete files/folders
 
+Key detail: this whole app runs as one long-lived Python process. If you install
+a new binary (like `ollama`) via the Terminal *after* this process has already
+started, that binary won't automatically be visible to Python's `PATH` unless
+Python re-checks. So instead of caching "is ollama available" once at startup,
+every relevant function re-scans PATH + common install locations on demand, and
+using the Terminal automatically refreshes the Models tab's status afterwards.
+
 Requirements:
   - pip install gradio
   - (Models tab) Ollama installed and on PATH: https://ollama.com
-    In Colab:
-      !curl -fsSL https://ollama.com/install.sh | sh
-      !nohup ollama serve > ollama.log 2>&1 &
 
 Run:
   python3 launcher.py
@@ -37,6 +41,38 @@ def human_size(num_bytes):
     return f"{num_bytes:.1f} PB"
 
 
+# Directories commonly used by install scripts, checked in addition to PATH.
+_CANDIDATE_BIN_DIRS = [
+    "/usr/local/bin",
+    "/usr/bin",
+    "/opt/ollama/bin",
+    "/opt/homebrew/bin",
+    os.path.expanduser("~/.ollama/bin"),
+    os.path.expanduser("~/bin"),
+    os.path.expanduser("~/.local/bin"),
+]
+
+
+def ensure_on_path(executable):
+    """
+    Return True if `executable` is runnable. Re-checks PATH fresh every call
+    (doesn't trust a cached result), and if the binary exists in a well-known
+    install directory that isn't currently on this process's PATH, adds that
+    directory to os.environ['PATH'] so subprocess calls can find it without
+    needing a full restart of this Python process.
+    """
+    if shutil.which(executable):
+        return True
+    for d in _CANDIDATE_BIN_DIRS:
+        exe = os.path.join(d, executable)
+        if os.path.isfile(exe) and os.access(exe, os.X_OK):
+            current = os.environ.get("PATH", "")
+            if d not in current.split(os.pathsep):
+                os.environ["PATH"] = d + os.pathsep + current
+            return True
+    return False
+
+
 # ============================================================================
 # Tab 1: Models (Ollama)
 # ============================================================================
@@ -54,21 +90,22 @@ MODELS = [
     {"name": "DeepSeek R1 7B",   "tag": "deepseek-r1:7b",  "size": "4.7 GB"},
 ]
 
-OLLAMA_AVAILABLE = shutil.which("ollama") is not None
+
+def ollama_ready():
+    return ensure_on_path("ollama")
 
 
-def ollama_missing_notice():
-    if OLLAMA_AVAILABLE:
-        return ""
+def ollama_notice():
+    if ollama_ready():
+        return "✅ **Ollama detected and ready.**"
     return (
-        "⚠️ **Ollama not found on PATH.** Install it first, e.g. in Colab:\n\n"
-        "```\n!curl -fsSL https://ollama.com/install.sh | sh\n"
-        "!nohup ollama serve > ollama.log 2>&1 &\n```"
+        "⚠️ **Ollama not found yet.** Click **Install Ollama** below, or run the "
+        "install command in the Terminal tab — either way this tab updates automatically."
     )
 
 
 def is_installed(tag):
-    if not OLLAMA_AVAILABLE:
+    if not ollama_ready():
         return False
     try:
         result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=10)
@@ -83,8 +120,8 @@ def status_label(tag):
 
 
 def install_model(tag, log_text):
-    if not OLLAMA_AVAILABLE:
-        new_log = (log_text or "") + f"\n[{tag}] Error: 'ollama' command not found.\n"
+    if not ollama_ready():
+        new_log = (log_text or "") + f"\n[{tag}] Error: 'ollama' not found. Install it first (see notice above).\n"
         yield new_log, status_label(tag), gr.update(interactive=True), gr.update(interactive=False)
         return
 
@@ -135,12 +172,46 @@ def clear_model_logs():
     return ""
 
 
+def install_ollama_binary(log_text):
+    """Runs the official Ollama install script, streamed into the model log."""
+    log_text = (log_text or "") + "\n$ curl -fsSL https://ollama.com/install.sh | sh\n"
+    yield log_text
+    try:
+        process = subprocess.Popen(
+            "curl -fsSL https://ollama.com/install.sh | sh",
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        for line in process.stdout:
+            log_text += line
+            yield log_text
+        process.wait()
+    except Exception as e:
+        log_text += f"Error: {e}\n"
+        yield log_text
+        return
+
+    if ensure_on_path("ollama"):
+        log_text += "\nOllama installed and detected. Starting server...\n"
+        yield log_text
+        try:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log_text += "Ollama server started in the background.\n"
+        except Exception as e:
+            log_text += f"Could not start server automatically: {e}\n"
+    else:
+        log_text += "\nInstall finished but 'ollama' still not found on PATH. Check the log above.\n"
+    yield log_text
+
+
 # ============================================================================
 # Tab 2: Terminal (arbitrary shell commands, streamed, persistent cwd)
 # ============================================================================
 
 def run_command(cmd, cwd, term_log):
-    """Generator: streams shell command output. Handles 'cd' locally to persist cwd."""
     cmd = (cmd or "").strip()
     term_log = term_log or ""
     if not cmd:
@@ -149,7 +220,6 @@ def run_command(cmd, cwd, term_log):
 
     term_log += f"\n{cwd}$ {cmd}\n"
 
-    # Handle 'cd' specially since each subprocess call is a fresh shell
     if cmd == "cd" or cmd.startswith("cd "):
         target = cmd[2:].strip() or os.path.expanduser("~")
         new_path = os.path.normpath(os.path.join(cwd, os.path.expanduser(target)))
@@ -237,10 +307,18 @@ def delete_path(target_path):
 with gr.Blocks(title="Launcher") as demo:
     gr.Markdown("# 🚀 Launcher")
 
+    # Components that need refreshing whenever ollama's availability might have
+    # changed (after Terminal commands, or the dedicated Install button).
+    notice_md = None
+    model_rows = []  # list of (tag, status_box, install_btn, delete_btn)
+
     with gr.Tabs():
         # ---------------- Models tab ----------------
         with gr.Tab("Models"):
-            gr.Markdown(ollama_missing_notice())
+            notice_md = gr.Markdown(ollama_notice())
+            with gr.Row():
+                install_ollama_btn = gr.Button("⬇️ Install Ollama", size="sm")
+
             model_log = gr.Textbox(label="Installation Logs", lines=12, max_lines=12,
                                     interactive=False, autoscroll=True)
             clear_models_btn = gr.Button("Clear logs", size="sm")
@@ -257,6 +335,8 @@ with gr.Blocks(title="Launcher") as demo:
                     install_btn = gr.Button("Install", size="sm", interactive=not is_installed(tag))
                     delete_btn = gr.Button("Delete", size="sm", interactive=is_installed(tag))
 
+                model_rows.append((tag, status_box, install_btn, delete_btn))
+
                 install_btn.click(
                     fn=install_model,
                     inputs=[gr.State(tag), model_log],
@@ -272,29 +352,17 @@ with gr.Blocks(title="Launcher") as demo:
         with gr.Tab("Terminal"):
             gr.Markdown(
                 "Run any shell command — `pip install ...`, `apt-get install ...`, "
-                "`git clone ...`, `rm ...`, `cd ...`, etc. Runs with your notebook's permissions."
+                "`curl -fsSL https://ollama.com/install.sh | sh`, `cd ...`, etc.\n\n"
+                "Installing something here (like Ollama) automatically refreshes the Models tab."
             )
             cwd_state = gr.State(os.getcwd())
             cwd_display = gr.Textbox(label="Working directory", value=os.getcwd(), interactive=False)
             term_log = gr.Textbox(label="Terminal", lines=18, max_lines=18,
-                                   interactive=False, autoscroll=True, elem_id="term-log")
+                                   interactive=False, autoscroll=True)
             with gr.Row():
                 cmd_input = gr.Textbox(label="Command", placeholder="pip install numpy", scale=5)
                 run_btn = gr.Button("Run", variant="primary", scale=1)
             clear_term_btn = gr.Button("Clear terminal", size="sm")
-
-            run_btn.click(
-                fn=run_command,
-                inputs=[cmd_input, cwd_state, term_log],
-                outputs=[term_log, cwd_state, cwd_display],
-            ).then(fn=lambda: "", outputs=cmd_input)
-
-            cmd_input.submit(
-                fn=run_command,
-                inputs=[cmd_input, cwd_state, term_log],
-                outputs=[term_log, cwd_state, cwd_display],
-            ).then(fn=lambda: "", outputs=cmd_input)
-
             clear_term_btn.click(fn=clear_terminal_log, outputs=term_log)
 
         # ---------------- Files tab ----------------
@@ -323,6 +391,40 @@ with gr.Blocks(title="Launcher") as demo:
             delete_result = gr.Textbox(label="Result", interactive=False)
 
             delete_btn.click(fn=delete_path, inputs=delete_input, outputs=delete_result)
+
+    # ------------------------------------------------------------------
+    # Unified refresh: re-check ollama availability + every model row's
+    # install state. Wired to fire after Terminal commands and the
+    # dedicated Install Ollama button, so the two tabs stay in sync.
+    # ------------------------------------------------------------------
+    def refresh_models_tab():
+        outputs = [ollama_notice()]
+        for tag, *_ in model_rows:
+            installed = is_installed(tag)
+            outputs.append(status_label(tag))
+            outputs.append(gr.update(interactive=not installed))
+            outputs.append(gr.update(interactive=installed))
+        return outputs
+
+    refresh_outputs = [notice_md]
+    for _tag, status_box, install_btn, delete_btn in model_rows:
+        refresh_outputs.extend([status_box, install_btn, delete_btn])
+
+    install_ollama_btn.click(
+        fn=install_ollama_binary, inputs=model_log, outputs=model_log,
+    ).then(fn=refresh_models_tab, outputs=refresh_outputs)
+
+    run_btn.click(
+        fn=run_command, inputs=[cmd_input, cwd_state, term_log],
+        outputs=[term_log, cwd_state, cwd_display],
+    ).then(fn=lambda: "", outputs=cmd_input
+    ).then(fn=refresh_models_tab, outputs=refresh_outputs)
+
+    cmd_input.submit(
+        fn=run_command, inputs=[cmd_input, cwd_state, term_log],
+        outputs=[term_log, cwd_state, cwd_display],
+    ).then(fn=lambda: "", outputs=cmd_input
+    ).then(fn=refresh_models_tab, outputs=refresh_outputs)
 
 
 if __name__ == "__main__":
