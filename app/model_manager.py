@@ -1,5 +1,5 @@
 """
-Model Manager - Fixed video model loading
+Model Manager - Fixed video model loading for all pipeline types
 """
 
 import os
@@ -9,7 +9,6 @@ import threading
 import time
 from typing import Dict, List, Optional, Any, Generator
 from dataclasses import dataclass, asdict
-import hashlib
 
 from huggingface_hub import snapshot_download
 import torch
@@ -22,7 +21,7 @@ class ModelInfo:
     id: str
     name: str
     repo_id: str
-    type: str  # 'clip', 'video', 'text'
+    type: str
     size_gb: float
     description: str
     installed: bool = False
@@ -31,9 +30,8 @@ class ModelInfo:
     in_use: bool = False
 
 
-# Model Registry with sizes
+# Model Registry
 MODEL_REGISTRY = {
-    # Video Models
     'stabilityai/stable-video-diffusion-img2vid': {
         'name': 'Stable Video Diffusion',
         'type': 'video',
@@ -55,7 +53,6 @@ MODEL_REGISTRY = {
         'description': 'Lightweight, good for animation',
         'vram_gb': 6.0
     },
-    # CLIP Models (for reference images)
     'openai/clip-vit-base-patch32': {
         'name': 'CLIP ViT-B/32',
         'type': 'clip',
@@ -72,23 +69,19 @@ MODEL_REGISTRY = {
     }
 }
 
-# Maximum storage (Colab: ~70GB, keep 10GB buffer)
 MAX_STORAGE_GB = 60.0
 
-# Tracking
 _loaded_models = {}
 _model_lock = threading.Lock()
 _download_in_progress = {}
 
 
 def get_model_size(model_id: str) -> float:
-    """Get model size in GB"""
     info = MODEL_REGISTRY.get(model_id, {})
     return info.get('size_gb', 1.0)
 
 
 def get_vram_required(model_id: str) -> float:
-    """Get VRAM required in GB"""
     info = MODEL_REGISTRY.get(model_id, {})
     return info.get('vram_gb', 4.0)
 
@@ -99,17 +92,14 @@ def is_installed(model_id: str) -> bool:
     if not os.path.exists(model_path):
         return False
     
-    # Check for model files - look for any model files
     for root, dirs, files in os.walk(model_path):
         for f in files:
             if f.endswith('.bin') or f.endswith('.safetensors') or f == 'model_index.json':
                 return True
-    
     return False
 
 
 def get_model_path(model_id: str) -> str:
-    """Get local model path"""
     safe_id = model_id.replace('/', '__')
     model_dir = os.path.join(config.MODEL_DIR, 'models')
     os.makedirs(model_dir, exist_ok=True)
@@ -117,12 +107,10 @@ def get_model_path(model_id: str) -> str:
 
 
 def get_installed_models() -> List[str]:
-    """Get list of installed model IDs"""
     return [mid for mid in MODEL_REGISTRY if is_installed(mid)]
 
 
 def list_models() -> List[Dict[str, Any]]:
-    """List all models with status"""
     models = []
     for model_id, info in MODEL_REGISTRY.items():
         installed = is_installed(model_id)
@@ -140,7 +128,6 @@ def list_models() -> List[Dict[str, Any]]:
 
 
 def calculate_total_storage() -> float:
-    """Calculate total storage used in GB"""
     total = 0.0
     for model_id in MODEL_REGISTRY:
         if is_installed(model_id):
@@ -149,7 +136,6 @@ def calculate_total_storage() -> float:
 
 
 def get_actual_model_size_gb(model_id: str) -> float:
-    """Get actual model size in GB"""
     model_path = get_model_path(model_id)
     if not os.path.exists(model_path):
         return 0.0
@@ -165,7 +151,6 @@ def get_actual_model_size_gb(model_id: str) -> float:
 
 
 def get_available_storage() -> Dict[str, float]:
-    """Get storage information"""
     used = calculate_total_storage()
     return {
         'used_gb': used,
@@ -176,7 +161,6 @@ def get_available_storage() -> Dict[str, float]:
 
 
 def get_vram_status() -> Dict[str, Any]:
-    """Get VRAM status"""
     if not torch.cuda.is_available():
         return {'device': 'cpu', 'available': False}
     
@@ -200,20 +184,15 @@ def auto_download_and_load_model(
     device: str = None,
     progress_callback=None
 ) -> Any:
-    """
-    AUTO-DOWNLOAD: Downloads model if not installed, then loads into VRAM.
-    """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     print(f"🔍 Checking model: {model_id}")
     
-    # Check if already loaded
     if model_id in _loaded_models and _loaded_models[model_id] is not None:
         print(f"✅ Model already loaded in VRAM")
         return _loaded_models[model_id]
     
-    # Check if installed
     if not is_installed(model_id):
         print(f"📥 Model not installed. Downloading...")
         
@@ -224,9 +203,7 @@ def auto_download_and_load_model(
         
         print(f"✅ Model downloaded!")
     
-    # Load into VRAM
     with _model_lock:
-        # Check VRAM
         if torch.cuda.is_available():
             vram_status = get_vram_status()
             vram_free = vram_status.get('free_gb', 0)
@@ -237,7 +214,6 @@ def auto_download_and_load_model(
                 _unload_unused_models(keep=[])
                 torch.cuda.empty_cache()
         
-        # Load the model
         loaded = _load_model_into_vram(model_id, device)
         _loaded_models[model_id] = loaded
         _update_last_used(model_id)
@@ -251,7 +227,6 @@ def smart_download_model(
     force: bool = False,
     progress_callback=None
 ) -> Generator[tuple, None, None]:
-    """Smart download with automatic cleanup"""
     if model_id not in MODEL_REGISTRY:
         yield (0, f"❌ Unknown model: {model_id}")
         return
@@ -298,8 +273,7 @@ def smart_download_model(
             local_dir=model_path,
             local_dir_use_symlinks=False,
             resume_download=True,
-            max_workers=4,
-            ignore_patterns=["*.safetensors", "*.bin"] if model_info['type'] == 'clip' else []
+            max_workers=4
         )
         
         yield (90, f"✅ Downloaded {model_info['name']}")
@@ -316,7 +290,6 @@ def smart_download_model(
 
 
 def _smart_cleanup(needed_gb: float) -> float:
-    """Delete old models to free space"""
     freed = 0.0
     
     installed_models = []
@@ -367,7 +340,6 @@ def _smart_cleanup(needed_gb: float) -> float:
 
 
 def _load_model_into_vram(model_id: str, device: str) -> Any:
-    """Load model into VRAM - FIXED: No offloading conflict"""
     model_info = MODEL_REGISTRY.get(model_id)
     if not model_info:
         raise ValueError(f"Unknown model: {model_id}")
@@ -381,7 +353,9 @@ def _load_model_into_vram(model_id: str, device: str) -> Any:
 
 
 def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
-    """Load video model - FIXED: No offloading"""
+    """
+    Load video model - FIXED: Handles all pipeline types properly
+    """
     from diffusers import DiffusionPipeline
     
     model_path = get_model_path(model_id)
@@ -391,7 +365,6 @@ def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
     print(f"📦 Loading video model: {model_id}")
     print(f"   Device: {device}")
     
-    # Use dtype instead of torch_dtype (deprecated)
     dtype = torch.float16 if device == 'cuda' else torch.float32
     
     # Special handling for different models
@@ -401,7 +374,8 @@ def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
             pipe = StableVideoDiffusionPipeline.from_pretrained(
                 model_path,
                 dtype=dtype,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                variant="fp16" if device == 'cuda' else None
             )
         else:
             # For ZeroScope and other models
@@ -411,43 +385,65 @@ def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
                 low_cpu_mem_usage=True
             )
         
-        # Move to device - but DON'T use both offloading AND .to()
-        # Choose ONE approach:
+        # FIXED: Check if pipeline has eval() before calling it
+        if hasattr(pipe, 'eval'):
+            pipe.eval()
         
+        # Handle device placement
         if device == 'cuda':
-            # Option A: Use model offloading (recommended for large models)
-            # This handles memory automatically
-            pipe.enable_model_cpu_offload()
-            # DO NOT call pipe.to(device) - offloading handles it
-            print("   Using CPU offloading (memory efficient)")
+            try:
+                # Try CPU offloading first (memory efficient)
+                if hasattr(pipe, 'enable_model_cpu_offload'):
+                    pipe.enable_model_cpu_offload()
+                    print("   Using CPU offloading (memory efficient)")
+                else:
+                    # Fallback: move to device directly
+                    pipe.to(device)
+                    print(f"   Moved to {device}")
+            except Exception as e:
+                print(f"   Offloading failed, trying direct device placement...")
+                try:
+                    pipe.to(device)
+                    print(f"   Moved to {device}")
+                except Exception as e2:
+                    print(f"   Device placement failed: {e2}")
+                    # Keep on CPU
+                    print("   Keeping on CPU")
         else:
-            # CPU mode - just move to CPU
-            pipe.to('cpu')
+            # CPU mode
+            try:
+                pipe.to('cpu')
+            except:
+                pass
             print("   Using CPU mode")
         
-        pipe.eval()
-        
-        return {'pipeline': pipe, 'device': device, 'using_offload': device == 'cuda'}
+        return {'pipeline': pipe, 'device': device}
         
     except Exception as e:
         print(f"❌ Failed to load model: {e}")
-        # Try fallback: load without offloading
+        # Fallback: try loading without optimization
         try:
-            print("   Attempting fallback load without offloading...")
+            print("   Attempting fallback load without optimizations...")
             pipe = DiffusionPipeline.from_pretrained(
                 model_path,
-                dtype=torch.float32,
                 low_cpu_mem_usage=True
             )
-            pipe.to(device)
-            pipe.eval()
-            return {'pipeline': pipe, 'device': device, 'using_offload': False}
+            
+            if hasattr(pipe, 'eval'):
+                pipe.eval()
+            
+            # Try to move to device
+            try:
+                pipe.to(device)
+            except:
+                pass
+            
+            return {'pipeline': pipe, 'device': device}
         except Exception as e2:
             raise RuntimeError(f"Both loading attempts failed: {e2}")
 
 
 def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
-    """Load CLIP model"""
     from transformers import CLIPModel, CLIPProcessor
     
     model_path = get_model_path(model_id)
@@ -459,7 +455,9 @@ def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
         low_cpu_mem_usage=True
     )
     model.to(device)
-    model.eval()
+    
+    if hasattr(model, 'eval'):
+        model.eval()
     
     processor = CLIPProcessor.from_pretrained(model_path)
     
@@ -467,29 +465,30 @@ def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
 
 
 def _unload_unused_models(keep: List[str] = None):
-    """Unload models from VRAM"""
     keep = keep or []
     
     for model_id, model_obj in list(_loaded_models.items()):
         if model_id not in keep and model_obj is not None:
-            # Move to CPU
-            if hasattr(model_obj, 'to'):
-                try:
-                    model_obj.to('cpu')
-                except:
-                    pass
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                # Try to move to CPU
+                if hasattr(model_obj, 'to'):
+                    try:
+                        model_obj.to('cpu')
+                    except:
+                        pass
+            except:
+                pass
             
             _loaded_models[model_id] = None
-            print(f"🧹 Unloaded {model_id} from VRAM")
+            print(f"🧹 Unloaded {model_id}")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     _loaded_models = {k: v for k, v in _loaded_models.items() if v is not None}
 
 
 def _update_last_used(model_id: str):
-    """Update last used timestamp"""
     model_path = get_model_path(model_id)
     timestamp_file = os.path.join(model_path, '.last_used')
     os.makedirs(os.path.dirname(timestamp_file), exist_ok=True)
@@ -498,7 +497,6 @@ def _update_last_used(model_id: str):
 
 
 def _get_last_used(model_id: str) -> float:
-    """Get last used timestamp"""
     timestamp_file = os.path.join(get_model_path(model_id), '.last_used')
     if os.path.exists(timestamp_file):
         try:
@@ -511,7 +509,6 @@ def _get_last_used(model_id: str) -> float:
 
 
 def delete_model(model_id: str) -> bool:
-    """Delete a model"""
     model_path = get_model_path(model_id)
     if os.path.exists(model_path):
         shutil.rmtree(model_path, ignore_errors=True)

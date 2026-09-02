@@ -1,56 +1,31 @@
 """
-Video Models - Complete implementation with fallback handling
+Video Models - Enhanced with better generation
 """
 
-from typing import List, Dict, Any, Optional
 import os
-import torch
 import base64
 import tempfile
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import time
-import traceback
+import torch
+import cv2
+from typing import List, Dict, Any, Optional
 
-# Video model registry
+
 VIDEO_MODEL_REGISTRY = {
-    'stabilityai/stable-video-diffusion-img2vid': {
-        'name': 'Stable Video Diffusion',
-        'type': 'img2vid',
-        'size_gb': 9.5,
-        'description': 'Image-to-video generation - best quality'
-    },
     'cerspense/zeroscope_v2_576w': {
         'name': 'ZeroScope v2',
         'type': 'text2vid',
         'size_gb': 7.2,
         'description': 'Text-to-video - good for general use'
+    },
+    'stabilityai/stable-video-diffusion-img2vid': {
+        'name': 'Stable Video Diffusion',
+        'type': 'img2vid',
+        'size_gb': 9.5,
+        'description': 'Image-to-video - best quality'
     }
 }
-
-
-def list_video_models() -> List[Dict[str, Any]]:
-    """List available video models"""
-    models = []
-    for model_id, info in VIDEO_MODEL_REGISTRY.items():
-        models.append({
-            'id': model_id,
-            'name': info['name'],
-            'type': info['type'],
-            'size_gb': info.get('size_gb', 0),
-            'description': info['description'],
-            'installed': is_video_model_installed(model_id)
-        })
-    return models
-
-
-def is_video_model_installed(model_id: str) -> bool:
-    """Check if a video model is installed"""
-    try:
-        from app import model_manager
-        return model_manager.is_installed(model_id)
-    except:
-        return False
 
 
 def generate_video(
@@ -65,159 +40,158 @@ def generate_video(
     reference_image: Optional[str] = None,
     callback=None
 ) -> Dict[str, Any]:
-    """
-    Generate a video clip using the specified model.
-    Returns base64-encoded video data.
-    """
+    """Generate video using loaded model"""
+    
     print(f"🎬 Generating video with model: {model_id}")
     print(f"   Prompt: {prompt[:100]}...")
     
-    # Try to use the real model
     try:
-        # Check if we should use a real model
+        # Check if model is in registry
         if model_id in VIDEO_MODEL_REGISTRY:
-            model_info = VIDEO_MODEL_REGISTRY[model_id]
+            # Try to use the loaded model from model_manager
+            from app import model_manager
             
-            if model_info['type'] == 'img2vid':
-                result = _generate_img2vid(
-                    prompt, model_id, context, duration_seconds, fps,
-                    width, height, seed, reference_image, callback
+            loaded = model_manager._loaded_models.get(model_id)
+            if loaded and loaded.get('pipeline'):
+                return _generate_with_pipeline(
+                    loaded['pipeline'],
+                    prompt,
+                    duration_seconds,
+                    fps,
+                    width,
+                    height,
+                    seed,
+                    reference_image
                 )
-            elif model_info['type'] == 'text2vid':
-                result = _generate_text2vid(
-                    prompt, model_id, context, duration_seconds, fps,
-                    width, height, seed, callback
-                )
-            else:
-                result = _generate_fallback_video(
-                    prompt, duration_seconds, fps, width, height, seed
-                )
-            
-            # Check if generation succeeded
-            if result and result.get('video_data'):
-                print(f"✅ Video generated: {len(result['video_data'])} bytes")
-                return result
-    
-    except Exception as e:
-        print(f"⚠️ Real model generation failed: {e}")
-        print(traceback.format_exc())
-    
-    # Fallback: generate a simple animated video
-    print("🔄 Using fallback video generation")
-    return _generate_fallback_video(prompt, duration_seconds, fps, width, height, seed)
-
-
-def _generate_img2vid(
-    prompt: str,
-    model_id: str,
-    context: Dict[str, Any],
-    duration: int,
-    fps: int,
-    width: int,
-    height: int,
-    seed: int,
-    reference_image: Optional[str],
-    callback=None
-) -> Dict[str, Any]:
-    """Generate video using Stable Video Diffusion"""
-    try:
-        from diffusers import StableVideoDiffusionPipeline
-        from diffusers.utils import load_image
         
-        model_path = _get_model_path(model_id)
-        
-        # Check if model exists
-        if not os.path.exists(model_path):
-            raise ValueError(f"Model not found at {model_path}")
-        
-        # Load pipeline
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        dtype = torch.float16 if device == 'cuda' else torch.float32
-        
-        pipe = StableVideoDiffusionPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True
+        # Try to generate with diffusers directly
+        return _generate_with_diffusers(
+            model_id,
+            prompt,
+            duration_seconds,
+            fps,
+            width,
+            height,
+            seed
         )
         
-        if device == 'cuda':
-            pipe.enable_model_cpu_offload()
-            pipe.enable_attention_slicing()
-        
-        # Load or create reference image
-        if reference_image:
-            import base64
-            from io import BytesIO
-            if reference_image.startswith('data:image'):
-                img_data = reference_image.split(',')[1]
-                img = Image.open(BytesIO(base64.b64decode(img_data)))
-            else:
-                img = load_image(reference_image)
-        else:
-            img = _create_placeholder_image(prompt, width, height)
-        
-        # Generate
-        generator = torch.Generator(device=device).manual_seed(seed)
-        frames = pipe(
-            img,
-            decode_chunk_size=2,
-            generator=generator,
-            num_frames=min(duration * fps, 24)
-        ).frames[0]
-        
-        # Convert to video
-        video_bytes = _frames_to_video_bytes(frames, fps)
-        
-        return {
-            'video_data': base64.b64encode(video_bytes).decode('utf-8'),
-            'duration': duration,
-            'fps': fps,
-            'width': width,
-            'height': height,
-            'metadata': {'model': model_id, 'seed': seed}
-        }
-        
     except Exception as e:
-        print(f"❌ SVD generation failed: {e}")
-        raise
+        print(f"⚠️ Real model generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Fallback: generate a simple video
+    print("🔄 Using fallback video generation")
+    return _generate_fallback_video(
+        prompt,
+        duration_seconds,
+        fps,
+        width,
+        height,
+        seed
+    )
 
 
-def _generate_text2vid(
+def _generate_with_pipeline(
+    pipeline,
     prompt: str,
-    model_id: str,
-    context: Dict[str, Any],
     duration: int,
     fps: int,
     width: int,
     height: int,
     seed: int,
-    callback=None
+    reference_image: Optional[str]
 ) -> Dict[str, Any]:
-    """Generate video using text-to-video models"""
+    """Generate using loaded pipeline"""
+    import torch
+    
     try:
-        from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        # Handle different pipeline types
+        if hasattr(pipeline, 'generate'):
+            # Some pipelines use generate()
+            frames = pipeline.generate(
+                prompt=prompt,
+                num_frames=min(duration * fps, 24),
+                height=height,
+                width=width,
+                generator=generator
+            )
+        elif hasattr(pipeline, '__call__'):
+            # Standard diffusion pipeline
+            frames = pipeline(
+                prompt,
+                num_frames=min(duration * fps, 24),
+                num_inference_steps=20,
+                height=height,
+                width=width,
+                generator=generator
+            ).frames
+        
+        if frames:
+            video_bytes = _frames_to_video_bytes(frames, fps)
+            return {
+                'video_data': base64.b64encode(video_bytes).decode('utf-8'),
+                'duration': duration,
+                'fps': fps,
+                'width': width,
+                'height': height,
+                'metadata': {'seed': seed, 'model': 'pipeline'}
+            }
+        
+    except Exception as e:
+        print(f"Pipeline generation failed: {e}")
+        raise
+    
+    raise RuntimeError("Pipeline generation returned no frames")
+
+
+def _generate_with_diffusers(
+    model_id: str,
+    prompt: str,
+    duration: int,
+    fps: int,
+    width: int,
+    height: int,
+    seed: int
+) -> Dict[str, Any]:
+    """Generate using diffusers directly"""
+    try:
+        from diffusers import DiffusionPipeline
+        import torch
         
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         dtype = torch.float16 if device == 'cuda' else torch.float32
         
-        # Use ZeroScope if available
+        # Use zeroscope if available
         if 'zeroscope' in model_id.lower():
-            model_path = 'cerspense/zeroscope_v2_576w'
+            model_path = "cerspense/zeroscope_v2_576w"
         else:
-            model_path = _get_model_path(model_id)
+            model_path = model_id
         
         pipe = DiffusionPipeline.from_pretrained(
             model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             low_cpu_mem_usage=True
         )
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
         
+        # Don't call eval() if not available
+        if hasattr(pipe, 'eval'):
+            pipe.eval()
+        
+        # Move to device
         if device == 'cuda':
-            pipe.enable_model_cpu_offload()
+            try:
+                pipe.enable_model_cpu_offload()
+            except:
+                pipe.to(device)
+        else:
+            pipe.to('cpu')
         
-        # Generate
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator = torch.Generator(device='cpu').manual_seed(seed)
+        
         frames = pipe(
             prompt,
             num_frames=min(duration * fps, 24),
@@ -235,12 +209,11 @@ def _generate_text2vid(
             'fps': fps,
             'width': width,
             'height': height,
-            'metadata': {'model': model_id, 'seed': seed}
+            'metadata': {'seed': seed, 'model': model_id}
         }
         
     except Exception as e:
-        print(f"❌ Text2Video generation failed: {e}")
-        raise
+        raise RuntimeError(f"Diffusers generation failed: {e}")
 
 
 def _generate_fallback_video(
@@ -251,15 +224,14 @@ def _generate_fallback_video(
     height: int,
     seed: int
 ) -> Dict[str, Any]:
-    """Generate a simple animated fallback video"""
+    """Generate a simple animated fallback video - BETTER VERSION"""
     try:
-        import cv2
         import numpy as np
         
         num_frames = min(duration * fps, 30)
         frames = []
         
-        # Use seed for reproducibility
+        # Use seed
         np.random.seed(seed)
         
         for i in range(num_frames):
@@ -281,16 +253,38 @@ def _generate_fallback_video(
                 )
                 frame[y, :] = color
             
-            # Add text
+            # Add text with better formatting
             font = cv2.FONT_HERSHEY_SIMPLEX
-            text = prompt[:50]
-            text_size = cv2.getTextSize(text, font, 0.6, 2)[0]
-            text_x = (width - text_size[0]) // 2
-            text_y = (height + text_size[1]) // 2
             
-            # Add text shadow
-            cv2.putText(frame, text, (text_x + 1, text_y + 1), font, 0.6, (0, 0, 0), 2)
-            cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
+            # Split prompt into lines
+            text_lines = prompt.split('.')[:3]
+            lines = []
+            for line in text_lines:
+                if len(line) > 30:
+                    words = line.split()
+                    current_line = []
+                    for word in words:
+                        if len(' '.join(current_line + [word])) <= 30:
+                            current_line.append(word)
+                        else:
+                            lines.append(' '.join(current_line))
+                            current_line = [word]
+                    if current_line:
+                        lines.append(' '.join(current_line))
+                else:
+                    lines.append(line.strip())
+            
+            # Draw text
+            for idx, line in enumerate(lines):
+                y_pos = height // 2 - (len(lines) * 30) // 2 + idx * 30
+                cv2.putText(frame, line, (10, y_pos), font, 0.5, (255, 255, 255), 1)
+            
+            # Add "Generating..." indicator
+            if i < num_frames - 1:
+                progress = (i / num_frames) * 100
+                cv2.putText(frame, f"Generating: {int(progress)}%", (10, height - 20), font, 0.4, (200, 200, 200), 1)
+            else:
+                cv2.putText(frame, "Complete!", (10, height - 20), font, 0.4, (0, 255, 0), 1)
             
             frames.append(frame)
         
@@ -305,13 +299,12 @@ def _generate_fallback_video(
             'metadata': {
                 'model': 'fallback',
                 'seed': seed,
-                'note': 'Fallback video generated - install real models for better quality'
+                'note': 'Real model failed - using fallback'
             }
         }
         
     except Exception as e:
-        print(f"❌ Fallback generation failed: {e}")
-        # Return empty video data
+        print(f"Fallback generation failed: {e}")
         return {
             'video_data': '',
             'duration': duration,
@@ -320,32 +313,6 @@ def _generate_fallback_video(
             'height': height,
             'metadata': {'error': str(e)}
         }
-
-
-def _get_model_path(model_id: str) -> str:
-    """Get model path from model_manager"""
-    try:
-        from app import model_manager
-        return model_manager.get_model_path(model_id)
-    except:
-        # Fallback path
-        return os.path.join(os.path.expanduser('~'), '.cache', 'models', model_id.replace('/', '__'))
-
-
-def _create_placeholder_image(prompt: str, width: int, height: int) -> Image.Image:
-    """Create a placeholder image with text"""
-    img = Image.new('RGB', (width, height), color='navy')
-    draw = ImageDraw.Draw(img)
-    
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 16)
-    except:
-        font = ImageFont.load_default()
-    
-    text = prompt[:100]
-    draw.text((10, height//2 - 10), text, fill='white', font=font)
-    
-    return img
 
 
 def _frames_to_video_bytes(frames: List[np.ndarray], fps: int) -> bytes:
@@ -379,5 +346,5 @@ def _frames_to_video_bytes(frames: List[np.ndarray], fps: int) -> bytes:
             return video_bytes
             
     except Exception as e:
-        print(f"❌ Failed to convert frames to video: {e}")
+        print(f"Failed to convert frames: {e}")
         return b''
