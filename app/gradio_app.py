@@ -49,10 +49,12 @@ def build_app():
                                 choices=[],  # Will be updated dynamically
                                 value=None
                             )
+                            # In the generate video tab, replace the video_model dropdown with:
+
                             video_model = gr.Dropdown(
-                                label="🎥 Video Model",
-                                choices=list(video_models.VIDEO_MODEL_REGISTRY.keys()),
-                                value=list(video_models.VIDEO_MODEL_REGISTRY.keys())[0] if video_models.VIDEO_MODEL_REGISTRY else None
+                            label="🎥 Video Model",
+                            choices=list(video_models.VIDEO_MODEL_REGISTRY.keys()) if hasattr(video_models, 'VIDEO_MODEL_REGISTRY') else [],
+                            value=list(video_models.VIDEO_MODEL_REGISTRY.keys())[0] if hasattr(video_models, 'VIDEO_MODEL_REGISTRY') and video_models.VIDEO_MODEL_REGISTRY else None
                             )
                         
                         with gr.Row():
