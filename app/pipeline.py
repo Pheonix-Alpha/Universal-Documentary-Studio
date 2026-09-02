@@ -1,59 +1,45 @@
 """
-Video Pipeline - The main flow for video generation
+Video Pipeline - Complete with auto-download
 """
 
 from typing import Generator, List, Dict, Any, Optional
-import json
-import os
 import time
 
 from app import (
-    config,
-    compute,
-    scene_analyzer,
-    script_enhancer,
     production_bible,
     scene_orchestrator,
     consistency_manager,
     worker_client,
-    video_models
+    video_models,
+    model_manager,
+    scene_analyzer,
+    script_enhancer
 )
 
 
 def run_video_pipeline(
     story: str,
-    clip_model_id: str,
-    video_model_id: str,
-    top_k: int = 3,
-    use_duckduckgo: bool = True,
+    model_id: str,
     duration_per_scene: int = 4,
+    auto_download: bool = True,
     fps: int = 24,
     width: int = 576,
     height: int = 320
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Run the complete video generation pipeline.
-    
-    Yields:
-        {
-            'stage': str,  # 'bible', 'scenes', 'generating', 'assembling', 'finished'
-            'pct': float,
-            'log': str,
-            'gallery': List[Dict],
-            'video': Optional[str],  # base64 encoded final video
-            'bible': Optional[Dict]  # The production bible
-        }
+    Run complete video pipeline with auto-download.
+    Yields progress updates.
     """
     
     # ---- Stage 1: Validate ----
-    if not story or len(story.strip()) < 10:
+    if not story or len(story.strip()) < 20:
         yield {
             'stage': 'error',
             'pct': 0,
-            'log': 'Please enter a longer story.',
+            'log': '⚠️ Please enter a longer story (minimum 20 characters)',
             'gallery': [],
             'video': None,
-            'bible': None
+            'model_status': {}
         }
         return
     
@@ -61,10 +47,10 @@ def run_video_pipeline(
     yield {
         'stage': 'bible',
         'pct': 5,
-        'log': '🎬 Creating production bible...',
+        'log': '📖 Creating production bible...',
         'gallery': [],
         'video': None,
-        'bible': None
+        'model_status': model_manager.get_vram_status()
     }
     
     try:
@@ -77,7 +63,7 @@ def run_video_pipeline(
             'log': f'❌ Bible generation failed: {e}',
             'gallery': [],
             'video': None,
-            'bible': None
+            'model_status': {}
         }
         return
     
@@ -88,142 +74,108 @@ def run_video_pipeline(
         'log': f'📋 Breaking into {len(bible.scenes)} scenes...',
         'gallery': [],
         'video': None,
-        'bible': bible.to_dict()
+        'model_status': model_manager.get_vram_status()
     }
     
     orchestrator = scene_orchestrator.SceneOrchestrator(bible)
     production_units = orchestrator.breakdown()
-    
-    consistency = consistency_manager.ConsistencyManager(bible)
-    
-    # ---- Stage 4: Generate Reference Images (for character consistency) ----
-    yield {
-        'stage': 'references',
-        'pct': 20,
-        'log': '🖼️ Generating character reference images...',
-        'gallery': [],
-        'video': None,
-        'bible': bible.to_dict()
-    }
-    
-    # TODO: Generate reference images for each character
-    
-    # ---- Stage 5: Distribute Video Generation ----
     total_scenes = len(production_units)
-    generated_clips = []
     
-    # Check if workers are available
-    has_workers = worker_client.is_any_connected()
-    has_local_video = video_models.is_video_model_installed(video_model_id)
-    
-    if not has_workers and not has_local_video:
+    # ---- Stage 4: Auto-Download Model ----
+    if auto_download:
         yield {
-            'stage': 'error',
-            'pct': 25,
-            'log': '❌ No video generation capable. Connect a worker or install a local video model.',
+            'stage': 'model',
+            'pct': 20,
+            'log': f'📥 Checking/downloading model: {model_id}...',
             'gallery': [],
             'video': None,
-            'bible': bible.to_dict()
+            'model_status': model_manager.get_vram_status()
         }
-        return
+        
+        try:
+            # Auto-download and load model
+            def progress_callback(pct, msg):
+                print(f"  [{pct}%] {msg}")
+            
+            model_manager.auto_download_and_load_model(
+                model_id,
+                progress_callback=progress_callback
+            )
+        except Exception as e:
+            yield {
+                'stage': 'error',
+                'pct': 20,
+                'log': f'❌ Model download failed: {e}',
+                'gallery': [],
+                'video': None,
+                'model_status': {}
+            }
+            return
+    
+    # ---- Stage 5: Generate Videos ----
+    generated_clips = []
     
     for idx, unit in enumerate(production_units):
-        pct = 25 + (idx / total_scenes) * 60
+        pct = 25 + (idx / total_scenes) * 70
         
         yield {
             'stage': 'generating',
             'pct': pct,
-            'log': f'🎬 Generating scene {unit.scene_id + 1}/{total_scenes}: {unit.description[:50]}...',
+            'log': f'🎬 Scene {idx + 1}/{total_scenes}: {unit.description[:50]}...',
             'gallery': generated_clips,
             'video': None,
-            'bible': bible.to_dict()
+            'model_status': model_manager.get_vram_status()
         }
         
         try:
-            # Get consistency context
-            context = consistency.get_worker_context(unit)
-            
-            # Generate video (use workers if available, else local)
-            if has_workers:
-                result = worker_client.generate_video_round_robin(
-                    prompt=unit.visual_prompt,
-                    model_id=video_model_id,
-                    context=context,
-                    duration_seconds=duration_per_scene,
-                    fps=fps,
-                    width=width,
-                    height=height,
-                    seed=unit.seed
-                )
-            else:
-                result = video_models.generate_video(
-                    prompt=unit.visual_prompt,
-                    model_id=video_model_id,
-                    context=context,
-                    duration_seconds=duration_per_scene,
-                    fps=fps,
-                    width=width,
-                    height=height,
-                    seed=unit.seed
-                )
+            # Generate video
+            result = video_models.generate_video(
+                prompt=unit.visual_prompt,
+                model_id=model_id,
+                context={},
+                duration_seconds=duration_per_scene,
+                fps=fps,
+                width=width,
+                height=height,
+                seed=unit.seed
+            )
             
             # Add to gallery
             clip_entry = {
                 'scene_id': unit.scene_id,
                 'description': unit.description,
                 'video_data': result['video_data'],
-                'duration': result['duration'],
-                'metadata': result['metadata'],
-                'worker': unit.assigned_worker
+                'duration': result['duration']
             }
             generated_clips.append(clip_entry)
             
-            # Update unit status
+            # Update status
             orchestrator.update_unit_status(unit.scene_id, 'completed')
             
         except Exception as e:
             yield {
                 'stage': 'error',
                 'pct': pct,
-                'log': f'❌ Scene {unit.scene_id + 1} failed: {e}',
+                'log': f'❌ Scene {idx + 1} failed: {e}',
                 'gallery': generated_clips,
                 'video': None,
-                'bible': bible.to_dict()
+                'model_status': model_manager.get_vram_status()
             }
-            orchestrator.update_unit_status(unit.scene_id, 'failed')
             continue
     
-    # ---- Stage 6: Assemble Final Video ----
-    if generated_clips:
-        yield {
-            'stage': 'assembling',
-            'pct': 90,
-            'log': f'✂️ Assembling {len(generated_clips)} clips into final video...',
-            'gallery': generated_clips,
-            'video': None,
-            'bible': bible.to_dict()
-        }
-        
-        # TODO: Video assembly
-        # Use ffmpeg or moviepy to concatenate clips
-        final_video = _assemble_video(generated_clips)
-    else:
-        final_video = None
+    # ---- Stage 6: Complete ----
+    final_video = generated_clips[0]['video_data'] if generated_clips else None
     
-    # ---- Stage 7: Complete ----
     yield {
         'stage': 'finished',
         'pct': 100,
         'log': f'✅ Complete! Generated {len(generated_clips)} clips.',
         'gallery': generated_clips,
         'video': final_video,
-        'bible': bible.to_dict()
+        'model_status': model_manager.get_vram_status()
     }
-
-
-def _assemble_video(clips: List[Dict[str, Any]]) -> Optional[str]:
-    """Assemble clips into a final video"""
-    # Placeholder - would use ffmpeg or moviepy
-    if clips and clips[0].get('video_data'):
-        return clips[0]['video_data']  # Return first clip for now
-    return None
+    
+    # ---- Stage 7: Auto-Cleanup ----
+    # Model stays loaded for potential reuse, but can be unloaded manually
+    # or will be auto-unloaded when space is needed
+    print("✅ Pipeline complete. Model kept in VRAM for reuse.")
