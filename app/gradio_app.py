@@ -1,6 +1,6 @@
 import gradio as gr
 
-from app import compute
+from app import compute, config
 from app import model_manager as mm
 from app import worker_client
 from app.pipeline import run_pipeline
@@ -96,88 +96,153 @@ def build_app():
                                     lambda v: v + 1, inputs=refresh_state, outputs=refresh_state
                                 )
 
-        with gr.Tab("⚙️ Worker (GPU offload)"):
+        with gr.Tab("⚙️ Workers (GPU offload)"):
             gr.Markdown(
-                "### Optional remote GPU worker\n"
-                "Run `python worker.py` in a **separate** Colab notebook (give that one "
-                "a GPU runtime), copy the URL it prints, and paste it below. Once "
-                "connected, storyboard generation automatically runs CLIP ranking on "
-                "that worker's GPU instead of this notebook -- manage its models here."
+                "### Optional remote GPU workers\n"
+                "Run `python worker.py` in one or more **separate** Colab notebooks "
+                "(each with its own GPU runtime), copy the URL each one prints, and "
+                "add it below. You can connect several at once -- storyboard generation "
+                "automatically round-robins CLIP ranking across every connected worker "
+                "instead of running locally, and falls back to the next worker if one "
+                "drops."
             )
             with gr.Row():
                 worker_url_box = gr.Textbox(
                     label="Worker URL",
                     placeholder="https://xxxx-xxxx.trycloudflare.com",
-                    value=worker_client.get_worker_url() or "",
-                    scale=4,
+                    scale=3,
                 )
-                connect_btn = gr.Button("🔌 Connect", scale=1, variant="primary")
-                disconnect_btn = gr.Button("Disconnect", scale=1)
+                worker_label_box = gr.Textbox(
+                    label="Label (optional)",
+                    placeholder="e.g. 'Colab A'",
+                    scale=2,
+                )
+                add_worker_btn = gr.Button("➕ Add worker", scale=1, variant="primary")
 
-            initial_connected, initial_msg = worker_client.is_connected()
-            worker_status = gr.Markdown(f"{'🟢' if initial_connected else '🔴'} {initial_msg}")
-            worker_refresh = gr.State(0)
+            workers_refresh = gr.State(0)
+            add_worker_status = gr.Markdown("")
             worker_model_status = gr.Markdown("")
 
-            def _connect(url):
-                worker_client.set_worker_url(url)
-                ok, msg = worker_client.is_connected()
-                return f"{'🟢' if ok else '🔴'} {msg}"
+            def _add_worker(url, label):
+                try:
+                    worker_client.add_worker(url, label)
+                    return "", "", ""
+                except Exception as e:  # noqa: BLE001
+                    return gr.update(), gr.update(), f"⚠️ {e}"
 
-            def _disconnect():
-                worker_client.set_worker_url(None)
-                return "🔴 Disconnected."
+            add_worker_btn.click(
+                _add_worker,
+                inputs=[worker_url_box, worker_label_box],
+                outputs=[worker_url_box, worker_label_box, add_worker_status],
+            ).then(lambda v: v + 1, inputs=workers_refresh, outputs=workers_refresh)
 
-            connect_btn.click(_connect, inputs=worker_url_box, outputs=worker_status).then(
-                lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
-            )
-            disconnect_btn.click(_disconnect, outputs=worker_status).then(
-                lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
-            )
-
-            gr.Markdown("#### Worker models")
-
-            @gr.render(inputs=worker_refresh)
-            def render_worker_models(_tick):
-                connected, _msg = worker_client.is_connected()
-                if not connected:
-                    gr.Markdown("_Connect to a worker above to see and manage its models._")
+            @gr.render(inputs=workers_refresh)
+            def render_workers(_tick):
+                workers = worker_client.list_workers()
+                if not workers:
+                    gr.Markdown("_No workers added yet. Paste a worker URL above and click Add worker._")
                     return
-                models = worker_client.list_models()
-                if not models:
-                    gr.Markdown("_Connected, but couldn't fetch the worker's model list._")
-                    return
-                for m in models:
+                for w in workers:
+                    icon = "🟢" if w["connected"] else "🔴"
+                    with gr.Accordion(f"{icon} {w['label']} — {w['status']}", open=False):
+                        gr.Markdown(f"`{w['url']}`")
+                        remove_btn = gr.Button("🗑️ Remove worker", size="sm", variant="stop")
+
+                        def _remove(worker_id=w["id"]):
+                            worker_client.remove_worker(worker_id)
+
+                        remove_btn.click(_remove, outputs=[]).then(
+                            lambda v: v + 1, inputs=workers_refresh, outputs=workers_refresh
+                        )
+
+                        if not w["connected"]:
+                            gr.Markdown("_Not reachable right now -- model list unavailable._")
+                            continue
+
+                        models = worker_client.list_models(w["id"])
+                        if not models:
+                            gr.Markdown("_Connected, but couldn't fetch its model list._")
+                            continue
+                        for m in models:
+                            with gr.Row():
+                                with gr.Column(scale=3):
+                                    status = "✅ Installed" if m["installed"] else "⬜ Not downloaded"
+                                    gr.Markdown(
+                                        f"**{m['name']}**  \n{m['description']}  \n~{m['size_mb']} MB · {status}"
+                                    )
+                                with gr.Column(scale=2):
+                                    if m["installed"]:
+                                        wdel_btn = gr.Button("🗑️ Delete", size="sm", variant="stop")
+
+                                        def _wdelete(worker_id=w["id"], model_id=m["id"], label=w["label"]):
+                                            worker_client.delete_model(worker_id, model_id)
+                                            return f"Deleted **{model_id}** on {label}."
+
+                                        wdel_btn.click(_wdelete, outputs=worker_model_status).then(
+                                            lambda v: v + 1, inputs=workers_refresh, outputs=workers_refresh
+                                        )
+                                    else:
+                                        wdl_btn = gr.Button("⬇️ Download", size="sm")
+                                        wdl_progress = gr.Slider(0, 100, value=0, label="Download %", interactive=False)
+
+                                        def _wdownload(worker_id=w["id"], model_id=m["id"]):
+                                            for pct, msg in worker_client.download_model_stream(worker_id, model_id):
+                                                if pct is None:
+                                                    yield gr.update(), msg
+                                                else:
+                                                    yield gr.update(value=pct), msg
+
+                                        wdl_btn.click(_wdownload, outputs=[wdl_progress, worker_model_status]).then(
+                                            lambda v: v + 1, inputs=workers_refresh, outputs=workers_refresh
+                                        )
+
+        with gr.Tab("🔑 API Keys"):
+            gr.Markdown(
+                "### Optional API keys\n"
+                "The app works without any of these (rule-based scene splitting, and "
+                "the no-key image sources only). Paste a key and hit Save -- it applies "
+                "immediately, no restart needed. Keys are kept in memory for this "
+                "session only, not written to disk."
+            )
+            keys_refresh = gr.State(0)
+
+            @gr.render(inputs=keys_refresh)
+            def render_keys(_tick):
+                for spec in config.KEY_SPECS:
+                    key_id = spec["id"]
+                    is_set = config.is_key_set(key_id)
                     with gr.Row():
-                        with gr.Column(scale=3):
-                            status = "✅ Installed" if m["installed"] else "⬜ Not downloaded"
-                            gr.Markdown(
-                                f"**{m['name']}**  \n{m['description']}  \n~{m['size_mb']} MB · {status}"
-                            )
                         with gr.Column(scale=2):
-                            if m["installed"]:
-                                wdel_btn = gr.Button("🗑️ Delete", size="sm", variant="stop")
+                            status = "🟢 Connected" if is_set else "⬜ Not set"
+                            gr.Markdown(
+                                f"**{spec['label']}** · {status}  \n{spec['note']}  \n"
+                                f"[Get a key]({spec['signup_url']})"
+                            )
+                        with gr.Column(scale=3):
+                            key_box = gr.Textbox(
+                                show_label=False,
+                                type="password",
+                                placeholder="Key is set (paste a new one to replace it)" if is_set else "Paste API key here",
+                            )
+                            with gr.Row():
+                                save_btn = gr.Button("💾 Save", size="sm", variant="primary")
+                                clear_btn = gr.Button("Clear", size="sm") if is_set else None
 
-                                def _wdelete(model_id=m["id"]):
-                                    worker_client.delete_model(model_id)
-                                    return f"Deleted **{model_id}** on the worker."
+                            def _save(value, key_id=key_id):
+                                config.set_key(key_id, value)
+                                return ""
 
-                                wdel_btn.click(_wdelete, outputs=worker_model_status).then(
-                                    lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
-                                )
-                            else:
-                                wdl_btn = gr.Button("⬇️ Download", size="sm")
-                                wdl_progress = gr.Slider(0, 100, value=0, label="Download %", interactive=False)
+                            save_btn.click(_save, inputs=key_box, outputs=key_box).then(
+                                lambda v: v + 1, inputs=keys_refresh, outputs=keys_refresh
+                            )
 
-                                def _wdownload(model_id=m["id"]):
-                                    for pct, msg in worker_client.download_model_stream(model_id):
-                                        if pct is None:
-                                            yield gr.update(), msg
-                                        else:
-                                            yield gr.update(value=pct), msg
+                            if clear_btn is not None:
+                                def _clear(key_id=key_id):
+                                    config.set_key(key_id, "")
+                                    return ""
 
-                                wdl_btn.click(_wdownload, outputs=[wdl_progress, worker_model_status]).then(
-                                    lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
+                                clear_btn.click(_clear, outputs=key_box).then(
+                                    lambda v: v + 1, inputs=keys_refresh, outputs=keys_refresh
                                 )
 
     return demo

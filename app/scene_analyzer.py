@@ -2,7 +2,7 @@
 import json
 import re
 
-from app.config import ANTHROPIC_API_KEY
+from app import config
 
 
 def _fallback_scene_split(story: str):
@@ -39,7 +39,7 @@ def _strip_code_fence(text: str) -> str:
 def _analyze_with_claude(story: str):
     import anthropic
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic(api_key=config.get_key("ANTHROPIC_API_KEY"))
     prompt = (
         "Break the following story into scenes for an image storyboard. "
         "For each scene extract any people, location, year and event mentioned "
@@ -59,7 +59,7 @@ def _analyze_with_claude(story: str):
 
 
 def analyze_story(story: str):
-    if ANTHROPIC_API_KEY:
+    if config.is_key_set("ANTHROPIC_API_KEY"):
         try:
             return _analyze_with_claude(story)
         except Exception as e:  # noqa: BLE001

@@ -32,7 +32,7 @@ import time
 
 import requests
 
-from app.config import FLICKR_API_KEY, PEXELS_API_KEY, PIXABAY_API_KEY
+from app import config
 
 USER_AGENT = "ResearchAIStoryboard/1.0 (educational prototype; https://github.com/)"
 HEADERS = {"User-Agent": USER_AGENT}
@@ -253,7 +253,8 @@ def search_loc(query: str, limit: int = 6, media_types=("image", "video")):
 # ------------------------------------------------------------------- Flickr
 def search_flickr(query: str, limit: int = 6, media_types=("image", "video")):
     """Optional -- set FLICKR_API_KEY (free): https://www.flickr.com/services/apps/create/"""
-    if not FLICKR_API_KEY:
+    flickr_key = config.get_key("FLICKR_API_KEY")
+    if not flickr_key:
         return []
     media_param = "all" if len(media_types) > 1 else ("photos" if "image" in media_types else "videos")
     try:
@@ -261,7 +262,7 @@ def search_flickr(query: str, limit: int = 6, media_types=("image", "video")):
             "https://api.flickr.com/services/rest/",
             params={
                 "method": "flickr.photos.search",
-                "api_key": FLICKR_API_KEY,
+                "api_key": flickr_key,
                 "text": query,
                 "media": media_param,
                 "license": "1,2,3,4,5,6,7,8,9,10",  # Creative Commons / public domain / no known restriction
@@ -292,10 +293,11 @@ def search_flickr(query: str, limit: int = 6, media_types=("image", "video")):
 # ------------------------------------------------------------------ Pexels
 def search_pexels(query: str, limit: int = 6, media_types=("image", "video")):
     """Optional -- set PEXELS_API_KEY (free): https://www.pexels.com/api/"""
-    if not PEXELS_API_KEY:
+    pexels_key = config.get_key("PEXELS_API_KEY")
+    if not pexels_key:
         return []
     headers = dict(HEADERS)
-    headers["Authorization"] = PEXELS_API_KEY
+    headers["Authorization"] = pexels_key
     results = []
     try:
         if "image" in media_types:
@@ -333,14 +335,15 @@ def search_pexels(query: str, limit: int = 6, media_types=("image", "video")):
 # ----------------------------------------------------------------- Pixabay
 def search_pixabay(query: str, limit: int = 6, media_types=("image", "video")):
     """Optional -- set PIXABAY_API_KEY (free): https://pixabay.com/api/docs/"""
-    if not PIXABAY_API_KEY:
+    pixabay_key = config.get_key("PIXABAY_API_KEY")
+    if not pixabay_key:
         return []
     results = []
     try:
         if "image" in media_types:
             r = requests.get(
                 "https://pixabay.com/api/",
-                params={"key": PIXABAY_API_KEY, "q": query, "per_page": max(3, limit)},
+                params={"key": pixabay_key, "q": query, "per_page": max(3, limit)},
                 headers=HEADERS,
                 timeout=10,
             )
@@ -354,7 +357,7 @@ def search_pixabay(query: str, limit: int = 6, media_types=("image", "video")):
         if "video" in media_types:
             r = requests.get(
                 "https://pixabay.com/api/videos/",
-                params={"key": PIXABAY_API_KEY, "q": query, "per_page": max(3, limit)},
+                params={"key": pixabay_key, "q": query, "per_page": max(3, limit)},
                 headers=HEADERS,
                 timeout=10,
             )

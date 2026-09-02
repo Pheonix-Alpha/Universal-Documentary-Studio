@@ -1,10 +1,11 @@
 """
 Single entry point the rest of the app (pipeline.py, gradio_app.py) calls
-for model management + CLIP ranking. Transparently routes to a connected
-worker (separate Colab GPU -- see worker.py / app/worker_client.py) when
-one is connected, and falls back to the local model_manager/clip_ranker
-otherwise. This is the "check in the background if a worker is present"
-logic -- callers never need to know which backend actually did the work.
+for model management + CLIP ranking. Transparently routes to whichever
+worker(s) are currently connected (separate Colab GPUs -- see worker.py /
+app/worker_client.py), round-robining ranking calls across all of them, and
+falls back to the local model_manager/clip_ranker when none are connected.
+This is the "check in the background if a worker is present" logic --
+callers never need to know which backend actually did the work.
 """
 from app import clip_ranker
 from app import model_manager as local_mm
@@ -12,41 +13,43 @@ from app import worker_client
 
 
 def backend_name() -> str:
-    """'worker' if a worker is connected and reachable right now, else 'local'."""
-    connected, _ = worker_client.is_connected()
-    return "worker" if connected else "local"
+    """'worker' if at least one worker is connected and reachable right
+    now, else 'local'."""
+    return "worker" if worker_client.is_any_connected() else "local"
 
 
 def list_models():
+    """Model registry for populating dropdowns etc. Every worker runs the
+    same codebase, so any connected worker's registry is representative --
+    this just needs *a* list of available model ids, not installed-ness
+    (see is_installed() for that, which checks every connected worker)."""
     if backend_name() == "worker":
-        models = worker_client.list_models()
-        if models:  # only trust the worker's answer if it actually returned one
+        wid = worker_client.connected_worker_ids()[0]
+        models = worker_client.list_models(wid)
+        if models:
             return models
     return local_mm.list_models()
 
 
 def is_installed(model_id: str) -> bool:
-    for m in list_models():
+    if backend_name() == "worker":
+        ids = worker_client.connected_worker_ids()
+        if not ids:
+            return False
+        # Ranking round-robins across every connected worker, so the model
+        # needs to be installed on ALL of them or a run could fail partway.
+        for wid in ids:
+            models = worker_client.list_models(wid)
+            if not any(m["id"] == model_id and m["installed"] for m in models):
+                return False
+        return True
+    for m in local_mm.list_models():
         if m["id"] == model_id:
             return m["installed"]
     return False
 
 
-def download_model_stream(model_id: str):
-    if backend_name() == "worker":
-        yield from worker_client.download_model_stream(model_id)
-    else:
-        yield from local_mm.download_model_stream(model_id)
-
-
-def delete_model(model_id: str):
-    if backend_name() == "worker":
-        worker_client.delete_model(model_id)
-    else:
-        local_mm.delete_model(model_id)
-
-
 def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5):
     if backend_name() == "worker":
-        return worker_client.rank_candidates(text, candidates, model_id=model_id, top_k=top_k)
+        return worker_client.rank_candidates_round_robin(text, candidates, model_id=model_id, top_k=top_k)
     return clip_ranker.rank_candidates(text, candidates, model_id=model_id, top_k=top_k)

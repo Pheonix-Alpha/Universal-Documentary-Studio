@@ -1,7 +1,7 @@
 """Scene dict -> list of 3-4 image-search query strings."""
 import json
 
-from app.config import ANTHROPIC_API_KEY
+from app import config
 from app.scene_analyzer import _strip_code_fence
 
 
@@ -31,7 +31,7 @@ def _fallback_queries(scene: dict):
 def _generate_with_claude(scene: dict):
     import anthropic
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic(api_key=config.get_key("ANTHROPIC_API_KEY"))
     prompt = (
         "Given this scene JSON, write 3-4 short, specific image-search queries "
         "that would find historically/factually accurate photos for it "
@@ -49,7 +49,7 @@ def _generate_with_claude(scene: dict):
 
 
 def generate_queries(scene: dict):
-    if ANTHROPIC_API_KEY:
+    if config.is_key_set("ANTHROPIC_API_KEY"):
         try:
             qs = _generate_with_claude(scene)
             if qs:
