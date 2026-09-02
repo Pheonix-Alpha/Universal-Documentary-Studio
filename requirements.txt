@@ -15,12 +15,6 @@ huggingface_hub
 # For Stable Video Diffusion
 xformers  # Optional for performance
 
-# For AnimateDiff
-# animate-diff  # Uncomment when available
-
-# For ModelScope
-# modelscope  # Uncomment for ModelScope support
-
 # For video assembly
 opencv-python-headless
 moviepy
@@ -28,7 +22,6 @@ moviepy
 # For worker-server
 fastapi
 uvicorn
-cloudflared  # For tunneling
 
 # API clients
 anthropic
