@@ -8,3 +8,5 @@ ddgs>=1.0.0
 tqdm
 numpy
 anthropic
+fastapi
+uvicorn

@@ -1,107 +1,112 @@
 """
-FastAPI app exposing model management + CLIP ranking, meant to run on a
-SEPARATE ("worker") Colab notebook so its GPU can be offloaded to from the
-main UI notebook. Started by worker.py -- not meant to be imported by the
-main app's own process (the main app talks to it over HTTP via
-app/worker_client.py).
+Client for an optional remote worker (a separate Colab notebook running
+worker.py) that offloads model downloads and CLIP ranking to its own GPU.
+
+The main app calls set_worker_url() when the person clicks Connect in the
+Worker tab, then is_connected()/list_models()/download_model_stream()/
+delete_model()/rank_candidates() all transparently no-op or raise if no
+worker is set, so the rest of the app doesn't need to special-case it.
 """
 import base64
 import io
-import threading
+import time
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import requests
+from PIL import Image
 
-from app import clip_ranker
-from app import model_manager as mm
-
-_download_jobs = {}  # model_id -> {"pct": float, "msg": str, "done": bool, "error": str|None}
+_state = {"url": None}
 
 
-class RankRequest(BaseModel):
-    text: str
-    candidates: list
-    model_id: str = "clip-vit-b-32"
-    top_k: int = 5
+def set_worker_url(url: str):
+    _state["url"] = url.strip().rstrip("/") if url and url.strip() else None
 
 
-def build_fastapi_app() -> FastAPI:
-    app = FastAPI(title="Storyboard Worker")
+def get_worker_url():
+    return _state["url"]
 
-    @app.get("/health")
-    def health():
+
+def is_connected(timeout: float = 4):
+    url = _state["url"]
+    if not url:
+        return False, "No worker URL set."
+    try:
+        r = requests.get(f"{url}/health", timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        return True, f"Connected ({data.get('device', '?')})"
+    except Exception as e:  # noqa: BLE001
+        return False, f"Not reachable: {e}"
+
+
+def list_models(timeout: float = 8):
+    url = _state["url"]
+    if not url:
+        return []
+    try:
+        r = requests.get(f"{url}/models", timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:  # noqa: BLE001
+        print(f"[worker_client] Failed to list worker models: {e}")
+        return []
+
+
+def download_model_stream(model_id: str, poll_interval: float = 1.0, timeout: float = 10):
+    """Starts a download on the worker and polls its progress, yielding
+    (pct, msg) with the same shape as model_manager.download_model_stream()."""
+    url = _state["url"]
+    if not url:
+        yield None, "No worker connected."
+        return
+    try:
+        r = requests.post(f"{url}/models/{model_id}/download", timeout=timeout)
+        r.raise_for_status()
+        if r.json().get("already_installed"):
+            yield 100, f"{model_id} already installed on worker."
+            return
+    except Exception as e:  # noqa: BLE001
+        yield None, f"Could not start worker download: {e}"
+        return
+
+    while True:
         try:
-            import torch
+            r = requests.get(f"{url}/models/{model_id}/progress", timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:  # noqa: BLE001
+            yield None, f"Lost connection to worker: {e}"
+            return
+        if data.get("error"):
+            yield None, data["error"]
+            return
+        yield data.get("pct", 0), data.get("msg", "")
+        if data.get("done"):
+            return
+        time.sleep(poll_interval)
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:  # noqa: BLE001
-            device = "unknown"
-        return {"status": "ok", "device": device}
 
-    @app.get("/models")
-    def list_models():
-        return mm.list_models()
+def delete_model(model_id: str, timeout: float = 15):
+    url = _state["url"]
+    if not url:
+        return
+    try:
+        requests.delete(f"{url}/models/{model_id}", timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        print(f"[worker_client] Failed to delete worker model {model_id}: {e}")
 
-    @app.post("/models/{model_id}/download")
-    def download(model_id: str):
-        if model_id not in mm.MODEL_REGISTRY:
-            raise HTTPException(404, f"Unknown model {model_id}")
-        if mm.is_installed(model_id):
-            return {"already_installed": True}
 
-        _download_jobs[model_id] = {"pct": 0, "msg": "starting...", "done": False, "error": None}
-
-        def _worker():
-            try:
-                for pct, msg in mm.download_model_stream(model_id):
-                    if pct is None:
-                        _download_jobs[model_id] = {"pct": 0, "msg": msg, "done": True, "error": msg}
-                        return
-                    _download_jobs[model_id] = {"pct": pct, "msg": msg, "done": False, "error": None}
-                _download_jobs[model_id]["done"] = True
-                _download_jobs[model_id]["pct"] = 100
-            except Exception as e:  # noqa: BLE001
-                _download_jobs[model_id] = {"pct": 0, "msg": str(e), "done": True, "error": str(e)}
-
-        threading.Thread(target=_worker, daemon=True).start()
-        return {"started": True}
-
-    @app.get("/models/{model_id}/progress")
-    def progress(model_id: str):
-        if model_id in _download_jobs:
-            return _download_jobs[model_id]
-        installed = mm.is_installed(model_id)
-        return {"pct": 100 if installed else 0, "msg": "installed" if installed else "not started",
-                "done": True, "error": None}
-
-    @app.delete("/models/{model_id}")
-    def delete(model_id: str):
-        mm.delete_model(model_id)
-        _download_jobs.pop(model_id, None)
-        return {"deleted": True}
-
-    @app.post("/rank")
-    def rank(req: RankRequest):
-        if not mm.is_installed(req.model_id):
-            raise HTTPException(400, f"Model {req.model_id} not installed on this worker")
-        ranked = clip_ranker.rank_candidates(req.text, req.candidates, model_id=req.model_id, top_k=req.top_k)
-        out = []
-        for r in ranked:
-            buf = io.BytesIO()
-            thumb = r["image"].copy()
-            thumb.thumbnail((480, 480))
-            thumb.convert("RGB").save(buf, format="JPEG", quality=80)
-            out.append(
-                {
-                    "url": r.get("url"),
-                    "thumbnail_url": r.get("thumbnail_url"),
-                    "source": r.get("source"),
-                    "title": r.get("title"),
-                    "media_type": r.get("media_type", "image"),
-                    "score": r["score"],
-                    "thumbnail_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
-                }
-            )
-        return {"results": out}
-
-    return app
+def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5, timeout: float = 60):
+    """Same contract as clip_ranker.rank_candidates(), executed remotely."""
+    url = _state["url"]
+    if not url:
+        raise RuntimeError("No worker connected.")
+    payload = {"text": text, "candidates": candidates, "model_id": model_id, "top_k": top_k}
+    r = requests.post(f"{url}/rank", json=payload, timeout=timeout)
+    r.raise_for_status()
+    out = []
+    for item in r.json()["results"]:
+        img = Image.open(io.BytesIO(base64.b64decode(item["thumbnail_base64"]))).convert("RGB")
+        c = dict(item)
+        c["image"] = img
+        out.append(c)
+    return out

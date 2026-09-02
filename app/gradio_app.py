@@ -1,11 +1,13 @@
 import gradio as gr
 
+from app import compute
 from app import model_manager as mm
+from app import worker_client
 from app.pipeline import run_pipeline
 
 
 def _clip_model_choices():
-    return [m["id"] for m in mm.list_models() if m["id"].startswith("clip")]
+    return [m["id"] for m in compute.list_models() if m["id"].startswith("clip")]
 
 
 def build_app():
@@ -92,6 +94,90 @@ def build_app():
 
                                 dl_btn.click(_download, outputs=[dl_progress, status_box]).then(
                                     lambda v: v + 1, inputs=refresh_state, outputs=refresh_state
+                                )
+
+        with gr.Tab("⚙️ Worker (GPU offload)"):
+            gr.Markdown(
+                "### Optional remote GPU worker\n"
+                "Run `python worker.py` in a **separate** Colab notebook (give that one "
+                "a GPU runtime), copy the URL it prints, and paste it below. Once "
+                "connected, storyboard generation automatically runs CLIP ranking on "
+                "that worker's GPU instead of this notebook -- manage its models here."
+            )
+            with gr.Row():
+                worker_url_box = gr.Textbox(
+                    label="Worker URL",
+                    placeholder="https://xxxx-xxxx.trycloudflare.com",
+                    value=worker_client.get_worker_url() or "",
+                    scale=4,
+                )
+                connect_btn = gr.Button("🔌 Connect", scale=1, variant="primary")
+                disconnect_btn = gr.Button("Disconnect", scale=1)
+
+            initial_connected, initial_msg = worker_client.is_connected()
+            worker_status = gr.Markdown(f"{'🟢' if initial_connected else '🔴'} {initial_msg}")
+            worker_refresh = gr.State(0)
+            worker_model_status = gr.Markdown("")
+
+            def _connect(url):
+                worker_client.set_worker_url(url)
+                ok, msg = worker_client.is_connected()
+                return f"{'🟢' if ok else '🔴'} {msg}"
+
+            def _disconnect():
+                worker_client.set_worker_url(None)
+                return "🔴 Disconnected."
+
+            connect_btn.click(_connect, inputs=worker_url_box, outputs=worker_status).then(
+                lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
+            )
+            disconnect_btn.click(_disconnect, outputs=worker_status).then(
+                lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
+            )
+
+            gr.Markdown("#### Worker models")
+
+            @gr.render(inputs=worker_refresh)
+            def render_worker_models(_tick):
+                connected, _msg = worker_client.is_connected()
+                if not connected:
+                    gr.Markdown("_Connect to a worker above to see and manage its models._")
+                    return
+                models = worker_client.list_models()
+                if not models:
+                    gr.Markdown("_Connected, but couldn't fetch the worker's model list._")
+                    return
+                for m in models:
+                    with gr.Row():
+                        with gr.Column(scale=3):
+                            status = "✅ Installed" if m["installed"] else "⬜ Not downloaded"
+                            gr.Markdown(
+                                f"**{m['name']}**  \n{m['description']}  \n~{m['size_mb']} MB · {status}"
+                            )
+                        with gr.Column(scale=2):
+                            if m["installed"]:
+                                wdel_btn = gr.Button("🗑️ Delete", size="sm", variant="stop")
+
+                                def _wdelete(model_id=m["id"]):
+                                    worker_client.delete_model(model_id)
+                                    return f"Deleted **{model_id}** on the worker."
+
+                                wdel_btn.click(_wdelete, outputs=worker_model_status).then(
+                                    lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
+                                )
+                            else:
+                                wdl_btn = gr.Button("⬇️ Download", size="sm")
+                                wdl_progress = gr.Slider(0, 100, value=0, label="Download %", interactive=False)
+
+                                def _wdownload(model_id=m["id"]):
+                                    for pct, msg in worker_client.download_model_stream(model_id):
+                                        if pct is None:
+                                            yield gr.update(), msg
+                                        else:
+                                            yield gr.update(value=pct), msg
+
+                                wdl_btn.click(_wdownload, outputs=[wdl_progress, worker_model_status]).then(
+                                    lambda v: v + 1, inputs=worker_refresh, outputs=worker_refresh
                                 )
 
     return demo

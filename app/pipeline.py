@@ -6,8 +6,7 @@ percentage + partial gallery results as each stage completes.
 """
 import time
 
-from app import clip_ranker, image_sources, query_generator, scene_analyzer
-from app import model_manager as mm
+from app import compute, image_sources, query_generator, scene_analyzer
 
 # Wikimedia is free and reliable; DuckDuckGo's unofficial endpoint rate-limits
 # hard under bursts. So: use every generated query against Wikimedia/Unsplash,
@@ -22,11 +21,13 @@ def run_pipeline(story: str, clip_model_id: str = "clip-vit-b-32", top_k: int = 
         yield {"stage": "Idle", "pct": 0, "log": "Enter a story and click Start.", "gallery": []}
         return
 
-    if not mm.is_installed(clip_model_id):
+    if not compute.is_installed(clip_model_id):
+        where = "the connected worker" if compute.backend_name() == "worker" else "this notebook"
         yield {
             "stage": "Error",
             "pct": 0,
-            "log": f"Model '{clip_model_id}' isn't downloaded yet. Go to the Models tab and download it first.",
+            "log": f"Model '{clip_model_id}' isn't downloaded on {where} yet. "
+                   f"Go to the Models (or Worker) tab and download it first.",
             "gallery": [],
         }
         return
@@ -74,7 +75,7 @@ def run_pipeline(story: str, clip_model_id: str = "clip-vit-b-32", top_k: int = 
             "log": f"Scene {i + 1}/{n}: ranking {len(unique)} candidate image(s) with {clip_model_id}...",
             "gallery": all_results,
         }
-        ranked = clip_ranker.rank_candidates(scene.get("description", ""), unique, model_id=clip_model_id, top_k=top_k)
+        ranked = compute.rank_candidates(scene.get("description", ""), unique, model_id=clip_model_id, top_k=top_k)
 
         for r in ranked:
             caption = f"Scene {scene.get('scene_id', i + 1)} | score={r['score']} | {r['source']}"
