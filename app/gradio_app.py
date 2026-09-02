@@ -1,14 +1,17 @@
 """
-Gradio UI - Clean Minimal with Worker Management
+Gradio UI - Fixed video handling
 """
 
 import gradio as gr
+import base64
+import tempfile
+import os
 from app import pipeline, model_manager, worker_client
 import time
 
 
 def build_app():
-    """Clean minimal UI with worker management"""
+    """Clean minimal UI with proper video handling"""
     
     with gr.Blocks(title="Universal Documentary Studio", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
@@ -23,7 +26,6 @@ def build_app():
             with gr.TabItem("🎬 Generate"):
                 with gr.Row():
                     with gr.Column(scale=2):
-                        # Story input
                         story_input = gr.Textbox(
                             label="📝 Your Story",
                             placeholder="Enter your story here... (minimum 50 characters)",
@@ -35,7 +37,6 @@ def build_app():
                         )
                         
                         with gr.Row():
-                            # Video model dropdown with proper choices
                             video_model_choices = [
                                 ("ZeroScope (Fast, 7GB)", "cerspense/zeroscope_v2_576w"),
                                 ("Stable Video Diffusion (Best, 9.5GB)", "stabilityai/stable-video-diffusion-img2vid"),
@@ -45,8 +46,7 @@ def build_app():
                             video_model = gr.Dropdown(
                                 label="🎥 Video Model",
                                 choices=video_model_choices,
-                                value="cerspense/zeroscope_v2_576w",  # Default value must be in choices
-                                allow_custom_value=False  # Don't allow custom values
+                                value="cerspense/zeroscope_v2_576w"
                             )
                         
                         with gr.Row():
@@ -58,19 +58,19 @@ def build_app():
                         progress = gr.Slider(0, 100, value=0, label="📈 Progress", interactive=False)
                         log = gr.Textbox(label="📋 Log", lines=8, interactive=False)
                 
-                # Output section
+                # Output section - using Video component with proper handling
                 with gr.Row():
                     with gr.Column():
                         gallery = gr.Gallery(label="🎞️ Generated Clips", columns=3, height=250)
                     with gr.Column():
-                        final_video = gr.Video(label="🎬 Final Video")
+                        final_video = gr.Video(label="🎬 Final Video", height=300)
                 
                 # Model status (collapsible)
                 with gr.Accordion("⚙️ Model Status (Auto)", open=False):
                     model_status = gr.JSON(label="Current Status", value={})
             
             # ============================================================
-            # TAB 2: Workers (Where you add GPU workers)
+            # TAB 2: Workers
             # ============================================================
             with gr.TabItem("⚙️ Workers"):
                 gr.Markdown("""
@@ -84,7 +84,6 @@ def build_app():
                 3. Paste it below and click "Add Worker"
                 """)
                 
-                # Worker add section
                 with gr.Row():
                     with gr.Column(scale=3):
                         worker_url_input = gr.Textbox(
@@ -106,26 +105,21 @@ def build_app():
                 gr.Markdown("---")
                 gr.Markdown("### 📋 Connected Workers")
                 
-                # Worker list
                 worker_status_html = gr.HTML(value="<div style='text-align: center; padding: 20px; color: #888;'>No workers connected. Add one above.</div>")
                 
                 with gr.Row():
                     refresh_workers_btn = gr.Button("🔄 Refresh Workers", variant="secondary")
                 
-                # Worker remove section
                 with gr.Row():
                     worker_to_remove = gr.Dropdown(
                         label="🗑️ Worker to Remove",
-                        choices=[],  # Will be populated dynamically
+                        choices=[],
                         value=None,
-                        allow_custom_value=True  # Allow because choices are dynamic
+                        allow_custom_value=True
                     )
                     remove_worker_btn = gr.Button("❌ Remove Worker", variant="stop")
                 
-                # ---- Worker Functions ----
-                
                 def get_worker_choices():
-                    """Get list of workers for dropdown"""
                     try:
                         workers = worker_client.list_workers()
                         return [(f"{w.get('label', 'Unknown')}", w.get('id', '')) for w in workers if w.get('id')]
@@ -133,7 +127,6 @@ def build_app():
                         return []
                 
                 def render_workers_html():
-                    """Render workers as HTML with status indicators"""
                     try:
                         workers = worker_client.list_workers()
                     except:
@@ -184,7 +177,6 @@ def build_app():
                     return html
                 
                 def add_worker_handler(url: str, label: str):
-                    """Add a worker and return updated UI"""
                     if not url or not url.strip():
                         return "❌ Please enter a worker URL", render_workers_html(), get_worker_choices()
                     
@@ -195,7 +187,6 @@ def build_app():
                         return f"❌ Failed to add worker: {e}", render_workers_html(), get_worker_choices()
                 
                 def remove_worker_handler(worker_id: str):
-                    """Remove a worker and return updated UI"""
                     if not worker_id:
                         return "⚠️ Please select a worker to remove", render_workers_html(), get_worker_choices()
                     
@@ -206,10 +197,7 @@ def build_app():
                         return f"❌ Failed to remove worker: {e}", render_workers_html(), get_worker_choices()
                 
                 def refresh_workers_handler():
-                    """Refresh worker list"""
                     return render_workers_html(), get_worker_choices()
-                
-                # ---- Wire up Worker Events ----
                 
                 add_worker_btn.click(
                     fn=add_worker_handler,
@@ -228,14 +216,13 @@ def build_app():
                     outputs=[worker_status_html, worker_to_remove]
                 )
                 
-                # Auto-refresh on load
                 demo.load(
                     fn=refresh_workers_handler,
                     outputs=[worker_status_html, worker_to_remove]
                 )
             
             # ============================================================
-            # TAB 3: API Keys (Optional)
+            # TAB 3: API Keys
             # ============================================================
             with gr.TabItem("🔑 API Keys"):
                 gr.Markdown("""
@@ -306,9 +293,29 @@ def build_app():
                     outputs=[api_status_html]
                 )
         
+        # ---- Helper: Convert base64 to video file ----
+        def base64_to_video_file(base64_data: str) -> str:
+            """Convert base64 video data to a temporary file for Gradio"""
+            if not base64_data:
+                return None
+            
+            try:
+                # Decode base64
+                video_bytes = base64.b64decode(base64_data)
+                
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                    tmp.write(video_bytes)
+                    tmp_path = tmp.name
+                
+                return tmp_path
+            except Exception as e:
+                print(f"Error converting video: {e}")
+                return None
+        
         # ---- Video Generation Handler ----
         def generate_video_handler(story, model_id, duration):
-            """Generate video with automatic everything"""
+            """Generate video with proper video handling"""
             if not story or len(story.strip()) < 20:
                 yield (
                     "❌ Error",
@@ -334,20 +341,29 @@ def build_app():
                     video_data = update.get('video', None)
                     model_status_data = update.get('model_status', {})
                     
+                    # Process gallery items - convert base64 to video files
                     gallery_display = []
                     for item in gallery_items:
                         if isinstance(item, dict):
                             if 'video_data' in item:
-                                gallery_display.append(item['video_data'])
+                                # Convert to video file for display
+                                video_path = base64_to_video_file(item['video_data'])
+                                if video_path:
+                                    gallery_display.append(video_path)
                             elif 'image' in item:
                                 gallery_display.append(item['image'])
+                    
+                    # Convert final video to file
+                    final_video_path = None
+                    if video_data:
+                        final_video_path = base64_to_video_file(video_data)
                     
                     yield (
                         stage.capitalize() if stage != 'error' else "❌ Error",
                         pct,
                         log_text,
                         gallery_display if gallery_display else [],
-                        video_data,
+                        final_video_path,
                         model_status_data
                     )
                     
