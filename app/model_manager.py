@@ -1,5 +1,5 @@
 """
-Model Manager - Complete auto-download, auto-cleanup, auto-swapping
+Model Manager - Fixed video model loading
 """
 
 import os
@@ -99,15 +99,13 @@ def is_installed(model_id: str) -> bool:
     if not os.path.exists(model_path):
         return False
     
-    # Check for model files
-    required_files = ['model_index.json', 'config.json', 'pytorch_model.bin']
-    has_files = False
+    # Check for model files - look for any model files
     for root, dirs, files in os.walk(model_path):
-        if any(f in required_files or f.endswith('.bin') or f.endswith('.safetensors') for f in files):
-            has_files = True
-            break
+        for f in files:
+            if f.endswith('.bin') or f.endswith('.safetensors') or f == 'model_index.json':
+                return True
     
-    return has_files
+    return False
 
 
 def get_model_path(model_id: str) -> str:
@@ -204,7 +202,6 @@ def auto_download_and_load_model(
 ) -> Any:
     """
     AUTO-DOWNLOAD: Downloads model if not installed, then loads into VRAM.
-    Automatically cleans up old models to free space.
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -220,7 +217,6 @@ def auto_download_and_load_model(
     if not is_installed(model_id):
         print(f"📥 Model not installed. Downloading...")
         
-        # Download with progress
         for pct, msg in smart_download_model(model_id):
             if progress_callback:
                 progress_callback(pct, msg)
@@ -228,7 +224,7 @@ def auto_download_and_load_model(
         
         print(f"✅ Model downloaded!")
     
-    # Load into VRAM (this will unload others if needed)
+    # Load into VRAM
     with _model_lock:
         # Check VRAM
         if torch.cuda.is_available():
@@ -255,15 +251,11 @@ def smart_download_model(
     force: bool = False,
     progress_callback=None
 ) -> Generator[tuple, None, None]:
-    """
-    Smart download with automatic cleanup of old models.
-    Yields (progress_percent, message) tuples.
-    """
+    """Smart download with automatic cleanup"""
     if model_id not in MODEL_REGISTRY:
         yield (0, f"❌ Unknown model: {model_id}")
         return
     
-    # Check if already downloading
     if model_id in _download_in_progress and _download_in_progress[model_id]:
         yield (0, f"⏳ Download already in progress")
         return
@@ -272,27 +264,22 @@ def smart_download_model(
     model_size = model_info.get('size_gb', 1.0)
     model_path = get_model_path(model_id)
     
-    # Check if already installed
     if is_installed(model_id) and not force:
         yield (100, f"✅ {model_info['name']} already installed")
         return
     
-    # Mark as downloading
     _download_in_progress[model_id] = True
     
     try:
-        # Calculate available space
         current_usage = calculate_total_storage()
         available = MAX_STORAGE_GB - current_usage
         
         yield (5, f"📊 Storage: {current_usage:.2f}GB / {MAX_STORAGE_GB}GB")
         
-        # Check if we need to free space
         if model_size > available:
             needed = model_size - available + 1.0
             yield (10, f"⚠️ Need {needed:.2f}GB more space. Cleaning old models...")
             
-            # Free space by deleting least recently used models
             freed = _smart_cleanup(needed)
             
             if freed < needed:
@@ -304,10 +291,8 @@ def smart_download_model(
             available = MAX_STORAGE_GB - current_usage
             yield (20, f"✅ Freed {freed:.2f}GB. Available: {available:.2f}GB")
         
-        # Download the model
         yield (30, f"⬇️ Downloading {model_info['name']} ({model_size:.1f}GB)...")
         
-        # Download
         snapshot_download(
             repo_id=model_id,
             local_dir=model_path,
@@ -318,15 +303,11 @@ def smart_download_model(
         )
         
         yield (90, f"✅ Downloaded {model_info['name']}")
-        
-        # Update last used
         _update_last_used(model_id)
-        
         yield (100, f"✅ {model_info['name']} ready!")
         
     except Exception as e:
         yield (0, f"❌ Download failed: {e}")
-        # Clean up partial download
         if os.path.exists(model_path):
             shutil.rmtree(model_path, ignore_errors=True)
     
@@ -335,13 +316,9 @@ def smart_download_model(
 
 
 def _smart_cleanup(needed_gb: float) -> float:
-    """
-    Intelligently delete models to free up space.
-    Deletes: not in use > oldest > largest
-    """
+    """Delete old models to free space"""
     freed = 0.0
     
-    # Get all installed models
     installed_models = []
     for model_id in MODEL_REGISTRY:
         if is_installed(model_id):
@@ -357,24 +334,20 @@ def _smart_cleanup(needed_gb: float) -> float:
                 'type': MODEL_REGISTRY[model_id]['type']
             })
     
-    # Sort: not in use first, then oldest, then largest
     installed_models.sort(key=lambda x: (
-        0 if not x['in_use'] else 1,  # Not in use first
-        -x['last_used'],  # Older first
-        -x['size']  # Larger first
+        0 if not x['in_use'] else 1,
+        -x['last_used'],
+        -x['size']
     ))
     
-    # Delete until we have enough space
     deleted = []
     for model in installed_models:
         if freed >= needed_gb:
             break
         
-        # Don't delete models in use
         if model['in_use']:
             continue
         
-        # Delete the model
         try:
             model_path = get_model_path(model['id'])
             if os.path.exists(model_path):
@@ -382,20 +355,19 @@ def _smart_cleanup(needed_gb: float) -> float:
                 freed += model['size']
                 deleted.append(model['id'])
                 
-                # Remove from loaded models if present
                 if model['id'] in _loaded_models:
                     del _loaded_models[model['id']]
         except Exception as e:
             print(f"Failed to delete {model['id']}: {e}")
     
     if deleted:
-        print(f"🧹 Deleted models to free space: {', '.join(deleted)}")
+        print(f"🧹 Deleted models: {', '.join(deleted)}")
     
     return freed
 
 
 def _load_model_into_vram(model_id: str, device: str) -> Any:
-    """Load model into VRAM"""
+    """Load model into VRAM - FIXED: No offloading conflict"""
     model_info = MODEL_REGISTRY.get(model_id)
     if not model_info:
         raise ValueError(f"Unknown model: {model_id}")
@@ -409,40 +381,69 @@ def _load_model_into_vram(model_id: str, device: str) -> Any:
 
 
 def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
-    """Load video model"""
+    """Load video model - FIXED: No offloading"""
     from diffusers import DiffusionPipeline
     
     model_path = get_model_path(model_id)
     if not os.path.exists(model_path):
         raise ValueError(f"Model not downloaded: {model_id}")
     
+    print(f"📦 Loading video model: {model_id}")
+    print(f"   Device: {device}")
+    
+    # Use dtype instead of torch_dtype (deprecated)
     dtype = torch.float16 if device == 'cuda' else torch.float32
     
     # Special handling for different models
-    if 'stable-video-diffusion' in model_id:
-        from diffusers import StableVideoDiffusionPipeline
-        pipe = StableVideoDiffusionPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            variant="fp16" if device == 'cuda' else None,
-            low_cpu_mem_usage=True
-        )
-    else:
-        pipe = DiffusionPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True
-        )
-    
-    # Enable optimizations
-    if device == 'cuda':
-        pipe.enable_attention_slicing()
-        pipe.enable_sequential_cpu_offload()
-    
-    pipe.to(device)
-    pipe.eval()
-    
-    return {'pipeline': pipe, 'device': device}
+    try:
+        if 'stable-video-diffusion' in model_id:
+            from diffusers import StableVideoDiffusionPipeline
+            pipe = StableVideoDiffusionPipeline.from_pretrained(
+                model_path,
+                dtype=dtype,
+                low_cpu_mem_usage=True
+            )
+        else:
+            # For ZeroScope and other models
+            pipe = DiffusionPipeline.from_pretrained(
+                model_path,
+                dtype=dtype,
+                low_cpu_mem_usage=True
+            )
+        
+        # Move to device - but DON'T use both offloading AND .to()
+        # Choose ONE approach:
+        
+        if device == 'cuda':
+            # Option A: Use model offloading (recommended for large models)
+            # This handles memory automatically
+            pipe.enable_model_cpu_offload()
+            # DO NOT call pipe.to(device) - offloading handles it
+            print("   Using CPU offloading (memory efficient)")
+        else:
+            # CPU mode - just move to CPU
+            pipe.to('cpu')
+            print("   Using CPU mode")
+        
+        pipe.eval()
+        
+        return {'pipeline': pipe, 'device': device, 'using_offload': device == 'cuda'}
+        
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
+        # Try fallback: load without offloading
+        try:
+            print("   Attempting fallback load without offloading...")
+            pipe = DiffusionPipeline.from_pretrained(
+                model_path,
+                dtype=torch.float32,
+                low_cpu_mem_usage=True
+            )
+            pipe.to(device)
+            pipe.eval()
+            return {'pipeline': pipe, 'device': device, 'using_offload': False}
+        except Exception as e2:
+            raise RuntimeError(f"Both loading attempts failed: {e2}")
 
 
 def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
@@ -466,7 +467,7 @@ def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
 
 
 def _unload_unused_models(keep: List[str] = None):
-    """Unload models from VRAM to free memory"""
+    """Unload models from VRAM"""
     keep = keep or []
     
     for model_id, model_obj in list(_loaded_models.items()):
@@ -478,20 +479,19 @@ def _unload_unused_models(keep: List[str] = None):
                 except:
                     pass
             
-            # Clear from GPU
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
             _loaded_models[model_id] = None
             print(f"🧹 Unloaded {model_id} from VRAM")
     
-    # Clean up dict
     _loaded_models = {k: v for k, v in _loaded_models.items() if v is not None}
 
 
 def _update_last_used(model_id: str):
     """Update last used timestamp"""
-    timestamp_file = os.path.join(get_model_path(model_id), '.last_used')
+    model_path = get_model_path(model_id)
+    timestamp_file = os.path.join(model_path, '.last_used')
     os.makedirs(os.path.dirname(timestamp_file), exist_ok=True)
     with open(timestamp_file, 'w') as f:
         json.dump({'timestamp': time.time()}, f)
