@@ -4,8 +4,17 @@ Orchestrates: story -> scenes -> queries -> multi-source retrieval -> CLIP ranki
 run_pipeline() is a generator so the Gradio UI can stream live status +
 percentage + partial gallery results as each stage completes.
 """
+import time
+
 from app import clip_ranker, image_sources, query_generator, scene_analyzer
 from app import model_manager as mm
+
+# Wikimedia is free and reliable; DuckDuckGo's unofficial endpoint rate-limits
+# hard under bursts. So: use every generated query against Wikimedia/Unsplash,
+# but only spend DuckDuckGo calls on the first couple of queries per scene,
+# with a short pause between web-search calls to avoid tripping the limiter.
+MAX_DDG_QUERIES_PER_SCENE = 2
+DELAY_BETWEEN_WEB_QUERIES_SEC = 1.5
 
 
 def run_pipeline(story: str, clip_model_id: str = "clip-vit-b-32", top_k: int = 3):
@@ -48,8 +57,11 @@ def run_pipeline(story: str, clip_model_id: str = "clip-vit-b-32", top_k: int = 
             "gallery": all_results,
         }
         candidates = []
-        for q in queries:
-            candidates += image_sources.gather_candidates(q)
+        for qi, q in enumerate(queries):
+            use_ddg = qi < MAX_DDG_QUERIES_PER_SCENE
+            candidates += image_sources.gather_candidates(q, use_duckduckgo=use_ddg)
+            if qi < len(queries) - 1:
+                time.sleep(DELAY_BETWEEN_WEB_QUERIES_SEC)
         seen, unique = set(), []
         for c in candidates:
             if c["url"] not in seen:

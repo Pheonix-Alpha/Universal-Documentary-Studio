@@ -4,7 +4,7 @@ transformers>=4.42.0
 torch
 pillow
 requests
-duckduckgo_search>=6.0.0
+ddgs>=1.0.0
 tqdm
 numpy
 anthropic
