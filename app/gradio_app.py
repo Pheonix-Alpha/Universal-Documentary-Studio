@@ -35,14 +35,18 @@ def build_app():
                         )
                         
                         with gr.Row():
+                            # Video model dropdown with proper choices
+                            video_model_choices = [
+                                ("ZeroScope (Fast, 7GB)", "cerspense/zeroscope_v2_576w"),
+                                ("Stable Video Diffusion (Best, 9.5GB)", "stabilityai/stable-video-diffusion-img2vid"),
+                                ("Realistic Vision (Light, 4.8GB)", "SG161222/Realistic_Vision_V5.1_noVAE")
+                            ]
+                            
                             video_model = gr.Dropdown(
                                 label="🎥 Video Model",
-                                choices=[
-                                    ("ZeroScope (Fast, 7GB)", "cerspense/zeroscope_v2_576w"),
-                                    ("Stable Video Diffusion (Best, 9.5GB)", "stabilityai/stable-video-diffusion-img2vid"),
-                                    ("Realistic Vision (Light, 4.8GB)", "SG161222/Realistic_Vision_V5.1_noVAE")
-                                ],
-                                value="cerspense/zeroscope_v2_576w"
+                                choices=video_model_choices,
+                                value="cerspense/zeroscope_v2_576w",  # Default value must be in choices
+                                allow_custom_value=False  # Don't allow custom values
                             )
                         
                         with gr.Row():
@@ -112,8 +116,9 @@ def build_app():
                 with gr.Row():
                     worker_to_remove = gr.Dropdown(
                         label="🗑️ Worker to Remove",
-                        choices=[],
-                        value=None
+                        choices=[],  # Will be populated dynamically
+                        value=None,
+                        allow_custom_value=True  # Allow because choices are dynamic
                     )
                     remove_worker_btn = gr.Button("❌ Remove Worker", variant="stop")
                 
