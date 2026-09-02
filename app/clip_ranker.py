@@ -43,6 +43,14 @@ def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32"
     text_inputs = processor(text=[text], return_tensors="pt", padding=True)
     with torch.no_grad():
         text_emb = model.get_text_features(**text_inputs)
+        # FIX: Check if it's a wrapper object and extract the tensor
+        if hasattr(text_emb, "text_embeds"):
+            text_emb = text_emb.text_embeds
+        elif hasattr(text_emb, "pooler_output"):
+            text_emb = text_emb.pooler_output
+        elif not isinstance(text_emb, torch.Tensor) and hasattr(text_emb, "last_hidden_state"):
+            text_emb = text_emb.last_hidden_state[:, 0, :]  # Fallback to CLS token
+
         text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
     scored = []
@@ -53,6 +61,12 @@ def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32"
         img_inputs = processor(images=img, return_tensors="pt")
         with torch.no_grad():
             img_emb = model.get_image_features(**img_inputs)
+            # FIX: Apply the same safe extraction for the image features wrapper
+            if hasattr(img_emb, "image_embeds"):
+                img_emb = img_emb.image_embeds
+            elif hasattr(img_emb, "pooler_output"):
+                img_emb = img_emb.pooler_output
+                
             img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
             sim = (text_emb @ img_emb.T).item()
         c2 = dict(c)
@@ -62,3 +76,4 @@ def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32"
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_k]
+
