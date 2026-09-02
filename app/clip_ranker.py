@@ -1,4 +1,4 @@
-"""Loads a locally-downloaded CLIP model and ranks candidate images against scene text."""
+"""Loads a locally-downloaded CLIP model and ranks candidate media against scene text."""
 import io
 
 import requests
@@ -35,38 +35,45 @@ def _fetch_image(url: str, timeout: int = 8):
         return None
 
 
+def _extract_embedding(output, *primary_attrs):
+    """model.get_text_features()/get_image_features() normally return a plain
+    tensor, but some transformers versions/model variants wrap the result in
+    an output object instead. Unwrap defensively rather than assuming either
+    shape -- this is what was causing AttributeError on `.norm()`."""
+    if isinstance(output, torch.Tensor):
+        return output
+    for attr in primary_attrs:
+        if hasattr(output, attr):
+            return getattr(output, attr)
+    if hasattr(output, "pooler_output"):
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state[:, 0, :]  # CLS token fallback
+    raise TypeError(f"Could not extract an embedding tensor from {type(output)}")
+
+
 def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5):
-    """Returns the top_k candidates, each with an added 'score' (cosine similarity, -1..1)
-    and 'image' (PIL.Image) field. Candidates whose image can't be fetched are dropped."""
+    """Returns the top_k candidates, each with an added 'score' (cosine
+    similarity, -1..1) and 'image' (PIL.Image, used for both CLIP scoring
+    and gallery/thumbnail display). Video candidates are scored via their
+    'thumbnail_url' rather than the (unplayable-as-an-image) 'url'.
+    Candidates whose thumbnail can't be fetched are dropped."""
     model, processor = _load_clip(model_id)
 
     text_inputs = processor(text=[text], return_tensors="pt", padding=True)
     with torch.no_grad():
-        text_emb = model.get_text_features(**text_inputs)
-        # FIX: Check if it's a wrapper object and extract the tensor
-        if hasattr(text_emb, "text_embeds"):
-            text_emb = text_emb.text_embeds
-        elif hasattr(text_emb, "pooler_output"):
-            text_emb = text_emb.pooler_output
-        elif not isinstance(text_emb, torch.Tensor) and hasattr(text_emb, "last_hidden_state"):
-            text_emb = text_emb.last_hidden_state[:, 0, :]  # Fallback to CLS token
-
+        text_emb = _extract_embedding(model.get_text_features(**text_inputs), "text_embeds")
         text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
 
     scored = []
     for c in candidates:
-        img = _fetch_image(c["url"])
+        thumb_url = c.get("thumbnail_url") or c.get("url")
+        img = _fetch_image(thumb_url)
         if img is None:
             continue
         img_inputs = processor(images=img, return_tensors="pt")
         with torch.no_grad():
-            img_emb = model.get_image_features(**img_inputs)
-            # FIX: Apply the same safe extraction for the image features wrapper
-            if hasattr(img_emb, "image_embeds"):
-                img_emb = img_emb.image_embeds
-            elif hasattr(img_emb, "pooler_output"):
-                img_emb = img_emb.pooler_output
-                
+            img_emb = _extract_embedding(model.get_image_features(**img_inputs), "image_embeds")
             img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
             sim = (text_emb @ img_emb.T).item()
         c2 = dict(c)
@@ -76,4 +83,3 @@ def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32"
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_k]
-
