@@ -49,6 +49,7 @@ class VideoGenResponse(BaseModel):
 
 
 def build_fastapi_app():
+    """Build the FastAPI app with all endpoints"""
     app = FastAPI(title="Universal Documentary Studio Worker")
 
     @app.get("/health")
@@ -88,7 +89,6 @@ def build_fastapi_app():
             else:
                 models = []
 
-            # Add video models
             if hasattr(video_models, "list_video_models"):
                 video_models_list = video_models.list_video_models()
             else:
@@ -126,7 +126,6 @@ def build_fastapi_app():
             if model_manager.is_installed(model_id):
                 return {"status": "already_installed", "model_id": model_id}
 
-            # Start download in background
             def download_task():
                 try:
                     job_data = {
@@ -247,87 +246,108 @@ def build_fastapi_app():
                 content={"error": str(e), "traceback": traceback.format_exc()},
             )
 
-    # ---- VIDEO GENERATION ENDPOINT - COMPLETE FIX ----
-    # In the /video/generate endpoint - WORKER downloads the model
-
-@app.post("/video/generate")
-async def generate_video(request: VideoGenRequest):
-    """Generate video - WORKER downloads model if needed"""
-    try:
-        print(f"🎬 Worker received request")
-        print(f"   Model: {request.model_id}")
-        print(f"   Prompt: {request.prompt[:100]}...")
-        
-        # ---- STEP 1: Worker checks if model is installed ----
-        # This happens on the WORKER, not the main app
-        if not model_manager.is_installed(request.model_id):
-            print(f"📥 Model not installed on worker. Downloading...")
-            
-            # Download on worker
-            for pct, msg in model_manager.smart_download_model(request.model_id):
-                print(f"  [{pct}%] {msg}")
-            
-            print(f"✅ Model downloaded on worker!")
-        
-        # ---- STEP 2: Load into VRAM on worker ----
-        print(f"🔄 Loading model into VRAM on worker...")
-        model_manager.auto_download_and_load_model(request.model_id)
-        print(f"✅ Model loaded on worker")
-        
-        # ---- STEP 3: Generate video on worker ----
-        print(f"🎬 Generating video on worker...")
-        result = video_models.generate_video(
-            prompt=request.prompt,
-            model_id=request.model_id,
-            context=request.context,
-            duration_seconds=request.duration_seconds,
-            fps=request.fps,
-            width=request.width,
-            height=request.height,
-            seed=request.seed,
-            reference_image=request.reference_image
-        )
-        
-        print(f"✅ Video generated on worker: {len(result['video_data'])} bytes")
-        return result
-        
-    except Exception as e:
-        print(f"❌ Worker generation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback on worker
+    # ---- VIDEO GENERATION ENDPOINT ----
+    @app.post("/video/generate")
+    async def generate_video(request: VideoGenRequest):
+        """Generate video with auto-download on worker"""
         try:
-            fallback = video_models._generate_fallback_video(
-                request.prompt,
-                request.duration_seconds,
-                request.fps,
-                request.width,
-                request.height,
-                request.seed
+            print(f"🎬 Worker received video generation request")
+            print(f"   Model: {request.model_id}")
+            print(f"   Prompt: {request.prompt[:100]}...")
+            print(f"   Duration: {request.duration_seconds}s")
+            print(f"   Seed: {request.seed}")
+
+            # ---- STEP 1: Check if model is installed on worker ----
+            if not model_manager.is_installed(request.model_id):
+                print(f"📥 Model not installed on worker. Downloading...")
+                
+                # Download on worker
+                for pct, msg in model_manager.smart_download_model(request.model_id):
+                    print(f"  [{pct}%] {msg}")
+                
+                print(f"✅ Model downloaded on worker!")
+
+            # ---- STEP 2: Load into VRAM on worker ----
+            print(f"🔄 Loading model into VRAM on worker...")
+            model_manager.auto_download_and_load_model(request.model_id)
+            print(f"✅ Model loaded on worker")
+
+            # ---- STEP 3: Generate video on worker ----
+            print(f"🎬 Generating video on worker...")
+            
+            if hasattr(video_models, 'generate_video'):
+                result = video_models.generate_video(
+                    prompt=request.prompt,
+                    model_id=request.model_id,
+                    context=request.context,
+                    duration_seconds=request.duration_seconds,
+                    fps=request.fps,
+                    width=request.width,
+                    height=request.height,
+                    seed=request.seed,
+                    reference_image=request.reference_image
+                )
+            else:
+                # Fallback using direct model
+                result = _generate_with_model(
+                    request.model_id,
+                    request.prompt,
+                    request.duration_seconds,
+                    request.fps,
+                    request.width,
+                    request.height,
+                    request.seed
+                )
+
+            # ---- STEP 4: Return result ----
+            if result and result.get('video_data'):
+                print(f"✅ Video generated on worker: {len(result['video_data'])} bytes")
+                return result
+            else:
+                raise RuntimeError("Video generation returned empty result")
+
+        except Exception as e:
+            print(f"❌ Worker generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # ---- FALLBACK: Use fallback video on worker ----
+            try:
+                print("🔄 Using fallback video on worker...")
+                fallback = video_models._generate_fallback_video(
+                    request.prompt,
+                    request.duration_seconds,
+                    request.fps,
+                    request.width,
+                    request.height,
+                    request.seed
+                )
+                
+                if fallback and fallback.get('video_data'):
+                    fallback['metadata']['error'] = str(e)
+                    fallback['metadata']['note'] = "Fallback video generated on worker"
+                    print(f"✅ Fallback video: {len(fallback['video_data'])} bytes")
+                    return fallback
+            except Exception as fallback_error:
+                print(f"❌ Fallback failed: {fallback_error}")
+
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                    "model_id": request.model_id
+                }
             )
-            if fallback and fallback.get('video_data'):
-                print(f"✅ Fallback video on worker")
-                return fallback
-        except:
-            pass
-        
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+
+    return app
 
 
 def _generate_with_model(model_id: str, prompt: str, duration: int, fps: int, width: int, height: int, seed: int) -> Dict[str, Any]:
-    """
-    Generate video using the loaded model.
-    This is a fallback if video_models.generate_video is not available.
-    """
+    """Generate video using loaded model (fallback)"""
     try:
         import torch
-        from diffusers import DiffusionPipeline
         
-        # Get the loaded model
         model_obj = model_manager._loaded_models.get(model_id)
         if not model_obj:
             raise ValueError(f"Model {model_id} not loaded")
@@ -338,12 +358,9 @@ def _generate_with_model(model_id: str, prompt: str, duration: int, fps: int, wi
         if not pipeline:
             raise ValueError("Pipeline not available")
         
-        # Generate
         generator = torch.Generator(device=device).manual_seed(seed)
         
-        # Handle different model types
         if hasattr(pipeline, 'generate'):
-            # Some pipelines use generate()
             frames = pipeline.generate(
                 prompt=prompt,
                 num_frames=min(duration * fps, 24),
@@ -352,7 +369,6 @@ def _generate_with_model(model_id: str, prompt: str, duration: int, fps: int, wi
                 generator=generator
             )
         else:
-            # Standard diffusion pipeline
             frames = pipeline(
                 prompt,
                 num_frames=min(duration * fps, 24),
@@ -362,7 +378,6 @@ def _generate_with_model(model_id: str, prompt: str, duration: int, fps: int, wi
                 generator=generator
             ).frames
         
-        # Convert to video bytes
         video_bytes = video_models._frames_to_video_bytes(frames, fps)
         
         return {
@@ -376,96 +391,3 @@ def _generate_with_model(model_id: str, prompt: str, duration: int, fps: int, wi
         
     except Exception as e:
         raise RuntimeError(f"Model generation failed: {e}")
-
-
-# ---- Additional helper for video_models ----
-def _generate_fallback_video(prompt: str, duration: int, fps: int, width: int, height: int, seed: int) -> Dict[str, Any]:
-    """
-    Simple fallback video generation - always works
-    """
-    try:
-        import cv2
-        import numpy as np
-        
-        num_frames = min(duration * fps, 30)
-        frames = []
-        
-        # Use seed
-        np.random.seed(seed)
-        
-        for i in range(num_frames):
-            # Create frame with gradient
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
-            
-            # Animated gradient
-            phase = i / max(1, num_frames)
-            r = int(80 + 155 * (0.5 + 0.5 * np.sin(phase * 2 * np.pi + seed)))
-            g = int(80 + 155 * (0.5 + 0.5 * np.sin(phase * 2 * np.pi + 2.094 + seed)))
-            b = int(80 + 155 * (0.5 + 0.5 * np.sin(phase * 2 * np.pi + 4.188 + seed)))
-            
-            for y in range(height):
-                ratio = y / max(1, height)
-                color = (
-                    int(r * (0.5 + 0.5 * (1 - ratio))),
-                    int(g * (0.5 + 0.5 * (1 - ratio))),
-                    int(b * (0.5 + 0.5 * (1 - ratio)))
-                )
-                frame[y, :] = color
-            
-            # Add text
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            text = prompt[:50]
-            text_size = cv2.getTextSize(text, font, 0.6, 2)[0]
-            text_x = (width - text_size[0]) // 2
-            text_y = (height + text_size[1]) // 2
-            
-            # Text shadow + main
-            cv2.putText(frame, text, (text_x + 1, text_y + 1), font, 0.6, (0, 0, 0), 2)
-            cv2.putText(frame, text, (text_x, text_y), font, 0.6, (255, 255, 255), 2)
-            
-            frames.append(frame)
-        
-        # Convert to video bytes
-        import tempfile
-        
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(tmp.name, fourcc, fps, (width, height))
-            for frame in frames:
-                out.write(frame)
-            out.release()
-            
-            with open(tmp.name, 'rb') as f:
-                video_bytes = f.read()
-            
-            os.unlink(tmp.name)
-        
-        return {
-            'video_data': base64.b64encode(video_bytes).decode('utf-8'),
-            'duration': duration,
-            'fps': fps,
-            'width': width,
-            'height': height,
-            'metadata': {
-                'model': 'fallback',
-                'seed': seed,
-                'note': 'Fallback video generated'
-            }
-        }
-        
-    except Exception as e:
-        print(f"Fallback generation failed: {e}")
-        # Return empty
-        return {
-            'video_data': '',
-            'duration': duration,
-            'fps': fps,
-            'width': width,
-            'height': height,
-            'metadata': {'error': str(e)}
-        }
-
-
-# Patch video_models if needed
-if not hasattr(video_models, '_generate_fallback_video'):
-    video_models._generate_fallback_video = _generate_fallback_video
