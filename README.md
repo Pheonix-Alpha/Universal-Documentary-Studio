@@ -1,73 +1,84 @@
-# Universal Documentary Studio (UDS)
+# Story → Verified Image Storyboard
 
-UDS turns a single topic into **one professional documentary per day**, plus
-3–5 derived Shorts, thumbnails, and metadata — with mandatory human review
-before anything is considered "done."
+A prototype of the pipeline: **story → scenes → multi-query search → multi-source
+image retrieval → CLIP re-ranking → storyboard**, wrapped in a single Gradio app,
+built to run on a free Colab T4.
 
-It is **topic-agnostic**: the same pipeline handles CEO stories, historical
-events, disasters, inventions, science, biographies, business
-competition, and any other documentary subject, with no category
-hard-coded as a special case.
+This is "Version 1–2" of the design (rule-based/LLM scene splitting, multi-query
+generation, Wikimedia/Unsplash/DuckDuckGo retrieval, CLIP ranking). Version 3+
+ideas (entity/date verification, VLM judging, the agentic retry loop) can be
+added inside `app/pipeline.py` without touching the UI.
 
-## Why this exists
+## Run it in Google Colab (one command after cloning)
 
-The developer's local machine (Ryzen 5000H, 8GB RAM, RTX 2050) cannot run
-heavyweight generative AI models. UDS is architected so that:
+In a Colab cell:
 
-- **Google Colab is the primary GPU worker.** Heavy jobs (AI image/video
-  generation, large TTS) prefer a remote GPU and queue or fall back
-  gracefully when one isn't available.
-- **The local machine never runs heavy AI automatically.** Local GPU use
-  requires an explicit opt-in (`local_gpu_enabled: true`).
-- **Every pipeline stage is checkpointed to disk**, so a disconnected
-  Colab session resumes from the last completed stage instead of
-  restarting.
-- **Nothing publishes itself.** A human must review and approve every
-  project before it's considered final.
-
-## Quickstart (MOCK_MODE — no GPU, no paid APIs required)
-
-```bash
-pip install -r requirements.txt
-python -m app.main --topic "The Invention of the Transistor" --full
+```python
+!git clone <YOUR_REPO_URL> research_ai && cd research_ai && python launcher.py
 ```
 
-This produces, in `projects/<project_id>/`:
+That single line will:
+1. `pip install` everything in `requirements.txt` (progress printed to the cell)
+2. Launch the Gradio app with `share=True`, printing a public URL you can open
+   (Colab doesn't expose `localhost` directly, so use that link, not `127.0.0.1`)
 
-- `renders/long_form.mp4` — an 8–15 minute (target-configurable) documentary
-- `shorts/short_1.mp4` … `short_N.mp4` — 3–5 independently scripted vertical Shorts
-- `thumbnails/thumbnail_*.png` — 3–5 thumbnail concepts
-- `qa.json`, `research.json`, `licenses/…` — QA, sourcing, and licensing reports
+**Optional, for better results** — run this in a cell *before* the command above:
 
-Launch the human-review dashboard instead:
-
-```bash
-python -m app.main --ui
+```python
+import os
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."      # enables LLM scene/query analysis
+os.environ["UNSPLASH_ACCESS_KEY"] = "..."           # adds Unsplash as an image source
 ```
 
-## Running tests
+Without these, the app still works: scenes are split with a rule-based sentence
+splitter, queries are generated with simple templates, and images come from
+Wikimedia Commons + DuckDuckGo image search (no keys required for either).
 
-```bash
-pip install -r requirements.txt
-PYTHONPATH=. pytest tests/ -q
+## Using the app
+
+- **Generate Storyboard tab**: paste a story, pick a CLIP model, hit **Start**.
+  You'll see the current stage, a live percentage bar, a scrolling log, and the
+  ranked images streaming into the gallery scene by scene.
+- **Models tab**: every model in the registry is listed with its size and
+  install status. Not downloaded → **Download** button with its own percentage
+  bar. Installed → **Delete** button to free disk space (useful since Colab's
+  disk is limited and shared with everything else in the runtime).
+
+The CLIP model dropdown on the Generate tab won't work until you've downloaded
+that model in the Models tab — the app will tell you if you try to run before
+downloading one.
+
+## Project layout
+
+```
+research_ai/
+├── launcher.py          # single entry point: pip install -> launch Gradio
+├── requirements.txt
+├── app/
+│   ├── config.py         # paths + optional API keys from env vars
+│   ├── model_manager.py  # model registry, download-with-progress, delete
+│   ├── scene_analyzer.py # story -> scenes (Claude API or rule-based fallback)
+│   ├── query_generator.py# scene -> 3-4 search queries
+│   ├── image_sources.py  # Wikimedia Commons / Unsplash / DuckDuckGo search
+│   ├── clip_ranker.py    # CLIP text<->image similarity ranking
+│   ├── pipeline.py       # orchestrates the stages, yields progress for the UI
+│   └── gradio_app.py     # the UI itself
+├── models/               # downloaded model weights (gitignored)
+└── data/                 # local cache (gitignored)
 ```
 
-All tests run in MOCK_MODE — no GPU, model download, or paid API is
-required. See `ARCHITECTURE.md` for how MOCK_MODE substitutes real PNG /
-WAV / MP4 files for expensive AI outputs so the entire pipeline is
-exercised end-to-end in CI.
+## Extending toward the full design
 
-## Documentation
-
-- `ARCHITECTURE.md` — system design, data flow, state machine, resource management
-- `SETUP_COLAB.md` — running the GPU worker notebook
-- `MODELS.md` — the model registry and how models are selected
-- `LICENSES.md` — licensing policy for assets, media, and AI models
-- `TROUBLESHOOTING.md` — common issues and how to diagnose them
-
-## Development milestones
-
-This repository was built milestone-by-milestone (see the original spec).
-Every stage has real interfaces, a working mock implementation, and unit +
-integration tests — nothing here is a stub or `NotImplementedError`
-placeholder for core functionality.
+- **Entity / date / location verification** (Version 3): add a scoring function
+  in `pipeline.py` that compares each candidate's metadata (where available)
+  against the scene JSON, and blend it into the CLIP score using the weighted
+  formula from the design doc (semantic + entity + location + time + source).
+- **VLM verification** (Version 4): add a `vlm_verifier.py` that asks a
+  vision-language model "does this image actually depict `<scene>`?" and use
+  it to filter/re-rank the CLIP shortlist before display.
+- **Agent loop** (Version 5): wrap the per-scene retrieval in `pipeline.py` in
+  a loop that re-generates queries and searches again when the best score is
+  below a confidence threshold, instead of accepting the first pass.
+- **Evaluation** (§14 of the design): build a small labeled test set (correct /
+  acceptable / incorrect image per scene) and compute Recall@k / Precision@5 /
+  MRR to actually measure whether changes help.
