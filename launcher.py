@@ -1,61 +1,56 @@
 #!/usr/bin/env python3
 """
-Single-command launcher for the Story -> Verified Image Storyboard project.
-
-Usage (after `git clone` this repo, from inside its folder):
-
-    python launcher.py
-
-This will:
-  1. pip-install everything in requirements.txt (prints progress)
-  2. create local `models/` and `data/` cache folders
-  3. launch the Gradio web app with a public share link (handy in Colab,
-     since Colab doesn't expose localhost directly)
-
-Optional environment variables (set them in a cell BEFORE running this,
-e.g. `import os; os.environ["ANTHROPIC_API_KEY"] = "..."`):
-
-  ANTHROPIC_API_KEY   -> enables LLM-based scene/query analysis (recommended)
-  UNSPLASH_ACCESS_KEY -> enables Unsplash as an extra image source
-
-Without these, the app still runs using rule-based scene splitting and
-Wikimedia Commons + DuckDuckGo image search only.
+Universal Documentary Studio - Main Launcher
+Run this in your primary Colab notebook.
 """
-import os
+
 import subprocess
 import sys
-
-ROOT = os.path.dirname(os.path.abspath(__file__))
-REQUIREMENTS_FILE = os.path.join(ROOT, "requirements.txt")
+import os
 
 
 def install_requirements():
-    print("=" * 70)
-    print("STEP 1/2 -- Installing dependencies (this can take a minute)")
-    print("=" * 70)
-    cmd = [
-        sys.executable, "-m", "pip", "install",
-        "--disable-pip-version-check", "-r", REQUIREMENTS_FILE,
-    ]
-    proc = subprocess.run(cmd)
-    if proc.returncode != 0:
-        print("\nDependency installation failed -- see the log above.")
-        sys.exit(1)
-    print("\nAll dependencies installed.\n")
+    """Install required packages"""
+    print("📦 Installing requirements...")
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-r", "requirements.txt"
+        ])
+        print("✅ Requirements installed.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to install requirements: {e}")
+        return False
 
 
 def launch_app():
-    print("=" * 70)
-    print("STEP 2/2 -- Launching Gradio app")
-    print("=" * 70)
-    sys.path.insert(0, ROOT)
+    """Launch the main application"""
+    # Add app directory to path
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    
     from app.gradio_app import build_app
-
+    import gradio as gr
+    
+    print("🚀 Launching Universal Documentary Studio...")
     demo = build_app()
-    # share=True gives you a public URL, which is what you need on Colab
-    demo.queue().launch(share=True, debug=False)
+    demo.queue(max_size=20).launch(share=True, debug=False)
+
+
+def main():
+    print("""
+    ╔═══════════════════════════════════════════╗
+    ║   🎬 Universal Documentary Studio        ║
+    ║   Powered by AI Video Generation         ║
+    ╚═══════════════════════════════════════════╝
+    """)
+    
+    if not install_requirements():
+        sys.exit(1)
+    
+    launch_app()
 
 
 if __name__ == "__main__":
-    install_requirements()
-    launch_app()
+    main()

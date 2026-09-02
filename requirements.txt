@@ -1,12 +1,39 @@
-gradio>=4.44.0
-huggingface_hub>=0.24.0
-transformers>=4.42.0
-torch
-pillow
-requests
-ddgs>=1.0.0
-tqdm
+# Core
+gradio>=4.0.0
 numpy
-anthropic
+Pillow
+requests
+
+# AI/ML
+torch>=2.0.0
+transformers
+diffusers
+accelerate
+huggingface_hub
+
+# Video generation (GPU-heavy)
+# For Stable Video Diffusion
+xformers  # Optional for performance
+
+# For AnimateDiff
+# animate-diff  # Uncomment when available
+
+# For ModelScope
+# modelscope  # Uncomment for ModelScope support
+
+# For video assembly
+opencv-python-headless
+moviepy
+
+# For worker-server
 fastapi
 uvicorn
+cloudflared  # For tunneling
+
+# API clients
+anthropic
+google-generativeai
+openai
+
+# Search and retrieval
+duckduckgo-search

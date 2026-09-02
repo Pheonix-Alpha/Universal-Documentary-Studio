@@ -1,176 +1,248 @@
 """
-Client for zero or more remote workers (each a separate Colab notebook
-running worker.py) that offload model downloads and CLIP ranking to their
-own GPU.
-
-Multiple workers can be connected at once: add_worker() registers one and
-returns an id, remove_worker() drops it, and list_workers() reports live
-connection status for every registered worker (used by the "Workers" tab
-in the UI). Model management (list_models/download_model_stream/
-delete_model) is per worker, keyed by that id.
-
-rank_candidates_round_robin() is what the rest of the app actually calls
-during a run (see app/compute.py) -- it spreads ranking calls across every
-currently-reachable worker in rotation, retrying on the next worker if one
-fails, so a story with many scenes gets processed across several GPUs at
-once instead of piling onto a single worker.
+Worker Client - Enhanced for video generation distribution
 """
-import base64
-import io
-import itertools
-import time
-import uuid
 
+from typing import List, Dict, Any, Optional, Generator
 import requests
+import itertools
+import json
+import base64
 from PIL import Image
+from io import BytesIO
+from urllib.parse import urlparse
+import time
 
-_workers = {}  # worker_id -> {"url": str, "label": str}
+# Worker registry
+_workers = {}
 _rr_counter = itertools.count()
 
 
-def add_worker(url: str, label: str = "") -> str:
-    """Registers a worker and returns its id. Re-adding the same URL just
-    returns the existing id rather than creating a duplicate entry."""
-    url = (url or "").strip().rstrip("/")
-    if not url:
-        raise ValueError("Worker URL can't be empty.")
-    for wid, w in _workers.items():
-        if w["url"] == url:
-            return wid
-    wid = uuid.uuid4().hex[:8]
-    _workers[wid] = {"url": url, "label": (label or "").strip() or url}
-    return wid
+def add_worker(url: str, label: str = None) -> str:
+    """Add a worker to the registry"""
+    # Normalize URL
+    if not url.startswith(('http://', 'https://')):
+        url = f'https://{url}'
+    url = url.rstrip('/')
+    
+    # Check if already exists
+    for worker_id, w in _workers.items():
+        if w['url'] == url:
+            return worker_id
+    
+    # Create new worker entry
+    worker_id = f"worker_{len(_workers) + 1}"
+    _workers[worker_id] = {
+        'id': worker_id,
+        'url': url,
+        'label': label or url,
+        'added_at': time.time(),
+        'last_health_check': 0,
+        'connected': False,
+        'status': 'unknown',
+        'device': 'unknown',
+        'capabilities': {},
+        'load': 0  # Number of active jobs
+    }
+    
+    # Initial health check
+    _check_worker(worker_id)
+    
+    return worker_id
 
 
-def remove_worker(worker_id: str):
-    _workers.pop(worker_id, None)
-
-
-def get_worker(worker_id: str):
-    return _workers.get(worker_id)
-
-
-def check_worker(worker_id: str, timeout: float = 4):
-    w = _workers.get(worker_id)
-    if not w:
-        return False, "Unknown worker."
+def _check_worker(worker_id: str) -> tuple:
+    """Check a worker's health and update its status"""
+    worker = _workers.get(worker_id)
+    if not worker:
+        return False, "Worker not found"
+    
     try:
-        r = requests.get(f"{w['url']}/health", timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        return True, f"Connected ({data.get('device', '?')})"
-    except Exception as e:  # noqa: BLE001
-        return False, f"Not reachable: {e}"
+        response = requests.get(f"{worker['url']}/health", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            worker['connected'] = True
+            worker['status'] = data.get('status', 'ok')
+            worker['device'] = data.get('device', 'unknown')
+            worker['capabilities'] = data.get('capabilities', {})
+            worker['last_health_check'] = time.time()
+            return True, "Connected"
+    except Exception:
+        pass
+    
+    worker['connected'] = False
+    worker['status'] = 'disconnected'
+    return False, "Disconnected"
 
 
-def list_workers():
-    """Returns [{id, url, label, connected, status}, ...] for the UI --
-    pings every registered worker so the list is always current."""
-    out = []
-    for wid, w in _workers.items():
-        connected, status = check_worker(wid)
-        out.append({"id": wid, "url": w["url"], "label": w["label"], "connected": connected, "status": status})
-    return out
-
-
-def connected_worker_ids():
-    return [w["id"] for w in list_workers() if w["connected"]]
+def list_workers() -> List[Dict[str, Any]]:
+    """List all workers with current status"""
+    workers = []
+    for worker_id, worker in _workers.items():
+        connected, status = _check_worker(worker_id)
+        workers.append({
+            'id': worker_id,
+            'url': worker['url'],
+            'label': worker['label'],
+            'connected': connected,
+            'status': status,
+            'device': worker.get('device', 'unknown'),
+            'capabilities': worker.get('capabilities', {}),
+            'load': worker.get('load', 0)
+        })
+    return workers
 
 
 def is_any_connected() -> bool:
-    return len(connected_worker_ids()) > 0
+    """Check if any workers are connected"""
+    for worker_id in _workers:
+        connected, _ = _check_worker(worker_id)
+        if connected:
+            return True
+    return False
 
 
-def list_models(worker_id: str, timeout: float = 8):
-    w = _workers.get(worker_id)
-    if not w:
-        return []
-    try:
-        r = requests.get(f"{w['url']}/models", timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:  # noqa: BLE001
-        print(f"[worker_client] Failed to list models on worker {worker_id}: {e}")
-        return []
+def connected_worker_ids() -> List[str]:
+    """Get all connected worker IDs"""
+    connected = []
+    for worker_id in _workers:
+        is_connected, _ = _check_worker(worker_id)
+        if is_connected:
+            connected.append(worker_id)
+    return connected
 
 
-def download_model_stream(worker_id: str, model_id: str, poll_interval: float = 1.0, timeout: float = 10):
-    """Starts a download on the given worker and polls its progress,
-    yielding (pct, msg) with the same shape as
-    model_manager.download_model_stream()."""
-    w = _workers.get(worker_id)
-    if not w:
-        yield None, "Unknown worker."
-        return
-    url = w["url"]
-    try:
-        r = requests.post(f"{url}/models/{model_id}/download", timeout=timeout)
-        r.raise_for_status()
-        if r.json().get("already_installed"):
-            yield 100, f"{model_id} already installed on worker."
-            return
-    except Exception as e:  # noqa: BLE001
-        yield None, f"Could not start worker download: {e}"
-        return
+# ---- VIDEO GENERATION ----
 
-    while True:
+def generate_video_round_robin(
+    prompt: str,
+    model_id: str,
+    context: Dict[str, Any] = None,
+    duration_seconds: int = 4,
+    fps: int = 24,
+    width: int = 576,
+    height: int = 320,
+    seed: int = 42,
+    reference_image: Optional[str] = None,
+    max_retries: int = 3
+) -> Dict[str, Any]:
+    """
+    Generate video using workers in round-robin fashion.
+    """
+    connected = connected_worker_ids()
+    if not connected:
+        raise RuntimeError("No connected workers available")
+    
+    # Try each worker in round-robin
+    for attempt in range(max_retries):
+        # Pick next worker
+        worker_id = connected[next(_rr_counter) % len(connected)]
+        
         try:
-            r = requests.get(f"{url}/models/{model_id}/progress", timeout=timeout)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:  # noqa: BLE001
-            yield None, f"Lost connection to worker: {e}"
-            return
-        if data.get("error"):
-            yield None, data["error"]
-            return
-        yield data.get("pct", 0), data.get("msg", "")
-        if data.get("done"):
-            return
-        time.sleep(poll_interval)
+            return _generate_video_on_worker(
+                worker_id, prompt, model_id, context,
+                duration_seconds, fps, width, height,
+                seed, reference_image
+            )
+        except Exception as e:
+            print(f"Worker {worker_id} failed: {e}")
+            # Remove from connected and try next
+            if worker_id in connected:
+                connected.remove(worker_id)
+            
+            if not connected:
+                break
+            
+            continue
+    
+    raise RuntimeError("All workers failed to generate video")
 
 
-def delete_model(worker_id: str, model_id: str, timeout: float = 15):
-    w = _workers.get(worker_id)
-    if not w:
-        return
+def _generate_video_on_worker(
+    worker_id: str,
+    prompt: str,
+    model_id: str,
+    context: Dict[str, Any],
+    duration_seconds: int,
+    fps: int,
+    width: int,
+    height: int,
+    seed: int,
+    reference_image: Optional[str]
+) -> Dict[str, Any]:
+    """Call a specific worker to generate video"""
+    worker = _workers.get(worker_id)
+    if not worker:
+        raise ValueError(f"Worker {worker_id} not found")
+    
+    if not worker.get('connected', False):
+        raise RuntimeError(f"Worker {worker_id} is not connected")
+    
+    # Increment load
+    worker['load'] = worker.get('load', 0) + 1
+    
     try:
-        requests.delete(f"{w['url']}/models/{model_id}", timeout=timeout)
-    except Exception as e:  # noqa: BLE001
-        print(f"[worker_client] Failed to delete model on worker {worker_id}: {e}")
+        # Prepare request
+        payload = {
+            'prompt': prompt,
+            'model_id': model_id,
+            'context': context or {},
+            'duration_seconds': duration_seconds,
+            'fps': fps,
+            'width': width,
+            'height': height,
+            'seed': seed,
+            'reference_image': reference_image
+        }
+        
+        # Send request
+        response = requests.post(
+            f"{worker['url']}/video/generate",
+            json=payload,
+            timeout=300  # 5 minutes for video generation
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # Verify video data
+        if 'video_data' not in result:
+            raise RuntimeError("Worker returned invalid response")
+        
+        return result
+        
+    finally:
+        # Decrement load
+        worker['load'] = max(0, worker.get('load', 0) - 1)
 
 
-def rank_candidates(worker_id: str, text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5, timeout: float = 60):
-    """Same contract as clip_ranker.rank_candidates(), executed on one specific worker."""
-    w = _workers.get(worker_id)
-    if not w:
-        raise RuntimeError(f"Unknown worker: {worker_id}")
-    payload = {"text": text, "candidates": candidates, "model_id": model_id, "top_k": top_k}
-    r = requests.post(f"{w['url']}/rank", json=payload, timeout=timeout)
-    r.raise_for_status()
-    out = []
-    for item in r.json()["results"]:
-        img = Image.open(io.BytesIO(base64.b64decode(item["thumbnail_base64"]))).convert("RGB")
-        c = dict(item)
-        c["image"] = img
-        out.append(c)
-    return out
-
-
-def rank_candidates_round_robin(text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5):
-    """Picks the next connected worker in rotation and ranks on it, falling
-    through to the other connected workers in turn if one is offline or
-    errors, so a single flaky worker doesn't fail the whole run."""
-    ids = connected_worker_ids()
-    if not ids:
-        raise RuntimeError("No worker connected.")
-    start = next(_rr_counter) % len(ids)
-    ordered = ids[start:] + ids[:start]
-    last_err = None
-    for wid in ordered:
+def list_video_models(worker_id: str = None) -> List[Dict[str, Any]]:
+    """List video models available on workers"""
+    if worker_id:
+        worker = _workers.get(worker_id)
+        if not worker:
+            return []
+        
         try:
-            return rank_candidates(wid, text, candidates, model_id=model_id, top_k=top_k)
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            print(f"[worker_client] Worker {wid} failed, trying next: {e}")
-    raise RuntimeError(f"All connected workers failed: {last_err}")
+            response = requests.get(f"{worker['url']}/models", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+        except Exception:
+            pass
+        return []
+    
+    # Aggregate from all workers
+    all_models = {}
+    for wid, worker in _workers.items():
+        if worker.get('connected', False):
+            try:
+                response = requests.get(f"{worker['url']}/models", timeout=5)
+                if response.status_code == 200:
+                    for model in response.json():
+                        model_id = model['id']
+                        if model_id not in all_models:
+                            all_models[model_id] = model
+                        all_models[model_id]['available_on'] = all_models[model_id].get('available_on', []) + [wid]
+            except Exception:
+                pass
+    
+    return list(all_models.values())
