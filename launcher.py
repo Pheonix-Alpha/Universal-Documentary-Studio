@@ -35,7 +35,7 @@ def launch_app():
     
     print("🚀 Launching Universal Documentary Studio...")
     demo = build_app()
-    demo.queue(max_size=20).launch(share=True, debug=False)
+    demo.queue(max_size=20).launch(share=True, debug=False, theme=gr.themes.Soft())
 
 
 def main():

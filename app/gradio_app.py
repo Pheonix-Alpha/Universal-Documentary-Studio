@@ -1,5 +1,5 @@
 """
-Gradio UI - Complete implementation with working Worker management
+Gradio UI - Complete working implementation with video generation
 """
 
 import gradio as gr
@@ -18,9 +18,13 @@ from app import (
 
 
 def build_app():
-    """Build the complete Gradio UI with working worker management"""
+    """Build the complete Gradio UI with working video generation"""
     
-    with gr.Blocks(title="Universal Documentary Studio", theme=gr.themes.Soft()) as demo:
+    # Get initial choices safely
+    video_model_choices = list(video_models.VIDEO_MODEL_REGISTRY.keys()) if hasattr(video_models, 'VIDEO_MODEL_REGISTRY') else []
+    video_model_default = video_model_choices[0] if video_model_choices else None
+    
+    with gr.Blocks(title="Universal Documentary Studio") as demo:
         gr.Markdown("""
         # 🎬 Universal Documentary Studio
         ### Turn stories into video documentaries with distributed GPU workers
@@ -28,46 +32,61 @@ def build_app():
         
         with gr.Tabs():
             # ============================================================
-            # TAB 1: Generate Video
+            # TAB 1: Generate Video - COMPLETELY FIXED
             # ============================================================
             with gr.TabItem("🎬 Generate Video"):
+                gr.Markdown("""
+                ### 📝 Enter your story below
+                The system will:
+                1. Analyze your story and create a production bible
+                2. Break it into scenes
+                3. Generate video clips for each scene
+                4. Assemble the final video
+                """)
+                
                 with gr.Row():
                     with gr.Column(scale=2):
+                        # Story input - THIS IS THE MAIN INPUT
                         story_input = gr.Textbox(
                             label="📝 Story",
-                            placeholder="Enter your story here...",
-                            lines=15,
+                            placeholder="Enter your story here... (minimum 50 characters)",
+                            lines=20,
                             value="""In the year 3024, humanity had colonized the solar system. 
                             Dr. Elena Vance, a xenobiologist, discovered an ancient signal from 
                             Europa's subsurface ocean. The signal wasn't random - it was a message 
-                            from an unknown intelligence."""
+                            from an unknown intelligence. The message contained complex mathematical 
+                            patterns that hinted at a civilization far more advanced than humanity. 
+                            Dr. Vance assembled a team of specialists to decode the message and 
+                            prepare for first contact."""
                         )
                         
                         with gr.Row():
                             clip_model = gr.Dropdown(
                                 label="🎯 CLIP Model (for reference images)",
                                 choices=[],  # Will be updated dynamically
-                                value=None
+                                value=None,
+                                allow_custom_value=True
                             )
-                            # In the generate video tab, replace the video_model dropdown with:
-
                             video_model = gr.Dropdown(
-                            label="🎥 Video Model",
-                            choices=list(video_models.VIDEO_MODEL_REGISTRY.keys()) if hasattr(video_models, 'VIDEO_MODEL_REGISTRY') else [],
-                            value=list(video_models.VIDEO_MODEL_REGISTRY.keys())[0] if hasattr(video_models, 'VIDEO_MODEL_REGISTRY') and video_models.VIDEO_MODEL_REGISTRY else None
+                                label="🎥 Video Model",
+                                choices=video_model_choices,
+                                value=video_model_default,
+                                allow_custom_value=True
                             )
                         
                         with gr.Row():
                             top_k = gr.Slider(1, 10, value=3, label="📊 Top K references")
                             duration = gr.Slider(2, 10, value=4, label="⏱️ Duration per scene (seconds)")
                         
+                        # Generate button
                         start_btn = gr.Button("🎬 Generate Video", variant="primary", size="lg")
                     
                     with gr.Column(scale=1):
                         status = gr.Label(value="💤 Idle")
                         progress = gr.Slider(0, 100, value=0, label="📈 Progress", interactive=False)
-                        log = gr.Textbox(label="📋 Log", lines=5, interactive=False)
+                        log = gr.Textbox(label="📋 Log", lines=8, interactive=False)
                 
+                # Gallery and video output
                 with gr.Row():
                     with gr.Column():
                         gallery = gr.Gallery(label="🎞️ Generated Clips", columns=3, height=300)
@@ -76,6 +95,77 @@ def build_app():
                 
                 with gr.Accordion("📖 Production Bible", open=False):
                     bible_json = gr.JSON(label="Bible Details")
+                
+                # ---- Video Generation Handler ----
+                def generate_video_handler(story, clip_model_id, video_model_id, top_k, duration):
+                    """Handle video generation with progress updates"""
+                    if not story or len(story.strip()) < 20:
+                        yield (
+                            "❌ Error",
+                            0,
+                            "⚠️ Please enter a longer story (minimum 20 characters)",
+                            [],
+                            None,
+                            None
+                        )
+                        return
+                    
+                    try:
+                        # Run the pipeline
+                        for update in pipeline.run_video_pipeline(
+                            story=story,
+                            clip_model_id=clip_model_id or "openai/clip-vit-base-patch32",
+                            video_model_id=video_model_id or video_model_default,
+                            top_k=top_k,
+                            duration_per_scene=duration,
+                            fps=24,
+                            width=576,
+                            height=320
+                        ):
+                            stage = update.get('stage', 'processing')
+                            pct = update.get('pct', 0)
+                            log_text = update.get('log', '')
+                            gallery_items = update.get('gallery', [])
+                            video_data = update.get('video', None)
+                            bible_data = update.get('bible', None)
+                            
+                            # Format gallery for display
+                            gallery_display = []
+                            for item in gallery_items:
+                                if isinstance(item, dict):
+                                    # Extract video data for display
+                                    if 'video_data' in item:
+                                        gallery_display.append(item['video_data'])
+                                    elif 'image' in item:
+                                        gallery_display.append(item['image'])
+                            
+                            yield (
+                                stage.capitalize(),
+                                pct,
+                                log_text,
+                                gallery_display if gallery_display else [],
+                                video_data,
+                                bible_data
+                            )
+                            
+                    except Exception as e:
+                        import traceback
+                        error_msg = f"❌ Error: {str(e)}\n{traceback.format_exc()}"
+                        yield (
+                            "Error",
+                            0,
+                            error_msg,
+                            [],
+                            None,
+                            None
+                        )
+                
+                # Wire up the generate button
+                start_btn.click(
+                    fn=generate_video_handler,
+                    inputs=[story_input, clip_model, video_model, top_k, duration],
+                    outputs=[status, progress, log, gallery, final_video, bible_json]
+                )
             
             # ============================================================
             # TAB 2: Models & Resources
@@ -119,7 +209,7 @@ def build_app():
                         'installed': installed,
                         'available': available,
                         'total_models': len(models),
-                        'total_storage_gb': sum(m['size_gb'] for m in installed)
+                        'total_storage_gb': sum(m.get('size_gb', 0) for m in installed)
                     }
                 
                 refresh_models_btn.click(
@@ -130,7 +220,8 @@ def build_app():
                 with gr.Row():
                     model_to_download = gr.Dropdown(
                         label="📥 Model to Download",
-                        choices=[(m['name'], m['id']) for m in model_manager.list_models() if not m['installed']]
+                        choices=[(m['name'], m['id']) for m in model_manager.list_models() if not m.get('installed', False)],
+                        allow_custom_value=True
                     )
                     download_btn = gr.Button("⬇️ Download Model", variant="primary")
                 
@@ -155,7 +246,8 @@ def build_app():
                 with gr.Row():
                     model_to_delete = gr.Dropdown(
                         label="🗑️ Model to Delete",
-                        choices=[(m['name'], m['id']) for m in model_manager.list_models() if m['installed']]
+                        choices=[(m['name'], m['id']) for m in model_manager.list_models() if m.get('installed', False)],
+                        allow_custom_value=True
                     )
                     delete_btn = gr.Button("🗑️ Delete Model", variant="stop")
                 
@@ -190,7 +282,7 @@ def build_app():
                 )
             
             # ============================================================
-            # TAB 3: Workers - COMPLETE WORKING IMPLEMENTATION
+            # TAB 3: Workers - FIXED
             # ============================================================
             with gr.TabItem("⚙️ Workers"):
                 gr.Markdown("""
@@ -235,7 +327,8 @@ def build_app():
                     worker_to_remove = gr.Dropdown(
                         label="🗑️ Worker to Remove",
                         choices=[],
-                        value=None
+                        value=None,
+                        allow_custom_value=True
                     )
                     remove_worker_btn = gr.Button("❌ Remove Worker", variant="stop")
                 
@@ -245,12 +338,18 @@ def build_app():
                 
                 def get_worker_choices():
                     """Get list of workers for dropdown"""
-                    workers = worker_client.list_workers()
-                    return [(f"{w['label']} ({w['url']})", w['id']) for w in workers if w['id']]
+                    try:
+                        workers = worker_client.list_workers()
+                        return [(f"{w.get('label', 'Unknown')} ({w.get('url', '')})", w.get('id', '')) for w in workers if w.get('id')]
+                    except:
+                        return []
                 
                 def render_workers_html():
                     """Render workers as HTML with status indicators"""
-                    workers = worker_client.list_workers()
+                    try:
+                        workers = worker_client.list_workers()
+                    except:
+                        workers = []
                     
                     if not workers:
                         return """
@@ -287,13 +386,13 @@ def build_app():
                         <div style='border: 1px solid #ddd; border-radius: 8px; padding: 15px; background: #fafafa;'>
                             <div style='display: flex; justify-content: space-between; align-items: start; flex-wrap: wrap; gap: 10px;'>
                                 <div style='flex: 1;'>
-                                    <h3 style='margin: 0 0 8px 0;'>{worker['label']}</h3>
+                                    <h3 style='margin: 0 0 8px 0;'>{worker.get('label', 'Unknown')}</h3>
                                     <div style='display: grid; grid-template-columns: auto 1fr; gap: 4px 15px; font-size: 14px;'>
                                         <span style='color: #666;'>ID:</span>
-                                        <span><code>{worker['id']}</code></span>
+                                        <span><code>{worker.get('id', 'N/A')}</code></span>
                                         
                                         <span style='color: #666;'>URL:</span>
-                                        <span style='word-break: break-all;'>{worker['url']}</span>
+                                        <span style='word-break: break-all;'>{worker.get('url', 'N/A')}</span>
                                         
                                         <span style='color: #666;'>Status:</span>
                                         <span style='color: {status_color}; font-weight: bold;'>{status_icon} {status_text}</span>
@@ -453,7 +552,7 @@ def build_app():
                 )
             
             # ============================================================
-            # TAB 5: Image Sources (Original)
+            # TAB 5: Image Sources
             # ============================================================
             with gr.TabItem("🖼️ Image Sources"):
                 gr.Markdown("""
@@ -482,7 +581,7 @@ def launch_app():
     """Launch the Gradio app"""
     print("🚀 Launching Universal Documentary Studio...")
     demo = build_app()
-    demo.queue(max_size=20).launch(share=True, debug=False)
+    demo.queue(max_size=20).launch(share=True, debug=False, theme=gr.themes.Soft())
 
 
 if __name__ == "__main__":
