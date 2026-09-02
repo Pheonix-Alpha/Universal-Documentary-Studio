@@ -1,5 +1,5 @@
 """
-Video Pipeline - Complete with auto-download
+Video Pipeline - Models download on workers, not main
 """
 
 from typing import Generator, List, Dict, Any, Optional
@@ -27,8 +27,8 @@ def run_video_pipeline(
     height: int = 320
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Run complete video pipeline with auto-download.
-    Yields progress updates.
+    Run complete video pipeline.
+    Models download on workers, not main.
     """
     
     # ---- Stage 1: Validate ----
@@ -43,14 +43,27 @@ def run_video_pipeline(
         }
         return
     
-    # ---- Stage 2: Generate Production Bible ----
+    # ---- Stage 2: Check Workers ----
+    has_workers = worker_client.is_any_connected()
+    
+    if not has_workers:
+        yield {
+            'stage': 'warning',
+            'pct': 5,
+            'log': '⚠️ No GPU workers connected. Video generation may be slow or unavailable.',
+            'gallery': [],
+            'video': None,
+            'model_status': {}
+        }
+    
+    # ---- Stage 3: Generate Production Bible ----
     yield {
         'stage': 'bible',
-        'pct': 5,
+        'pct': 10,
         'log': '📖 Creating production bible...',
         'gallery': [],
         'video': None,
-        'model_status': model_manager.get_vram_status()
+        'model_status': {}
     }
     
     try:
@@ -59,7 +72,7 @@ def run_video_pipeline(
     except Exception as e:
         yield {
             'stage': 'error',
-            'pct': 5,
+            'pct': 10,
             'log': f'❌ Bible generation failed: {e}',
             'gallery': [],
             'video': None,
@@ -67,56 +80,25 @@ def run_video_pipeline(
         }
         return
     
-    # ---- Stage 3: Scene Orchestration ----
+    # ---- Stage 4: Scene Orchestration ----
     yield {
         'stage': 'scenes',
-        'pct': 15,
+        'pct': 20,
         'log': f'📋 Breaking into {len(bible.scenes)} scenes...',
         'gallery': [],
         'video': None,
-        'model_status': model_manager.get_vram_status()
+        'model_status': {}
     }
     
     orchestrator = scene_orchestrator.SceneOrchestrator(bible)
     production_units = orchestrator.breakdown()
     total_scenes = len(production_units)
     
-    # ---- Stage 4: Auto-Download Model ----
-    if auto_download:
-        yield {
-            'stage': 'model',
-            'pct': 20,
-            'log': f'📥 Checking/downloading model: {model_id}...',
-            'gallery': [],
-            'video': None,
-            'model_status': model_manager.get_vram_status()
-        }
-        
-        try:
-            # Auto-download and load model
-            def progress_callback(pct, msg):
-                print(f"  [{pct}%] {msg}")
-            
-            model_manager.auto_download_and_load_model(
-                model_id,
-                progress_callback=progress_callback
-            )
-        except Exception as e:
-            yield {
-                'stage': 'error',
-                'pct': 20,
-                'log': f'❌ Model download failed: {e}',
-                'gallery': [],
-                'video': None,
-                'model_status': {}
-            }
-            return
-    
-    # ---- Stage 5: Generate Videos ----
+    # ---- Stage 5: Generate Videos on Workers ----
     generated_clips = []
     
     for idx, unit in enumerate(production_units):
-        pct = 25 + (idx / total_scenes) * 70
+        pct = 30 + (idx / total_scenes) * 65
         
         yield {
             'stage': 'generating',
@@ -124,28 +106,60 @@ def run_video_pipeline(
             'log': f'🎬 Scene {idx + 1}/{total_scenes}: {unit.description[:50]}...',
             'gallery': generated_clips,
             'video': None,
-            'model_status': model_manager.get_vram_status()
+            'model_status': {}
         }
         
         try:
-            # Generate video
-            result = video_models.generate_video(
-                prompt=unit.visual_prompt,
-                model_id=model_id,
-                context={},
-                duration_seconds=duration_per_scene,
-                fps=fps,
-                width=width,
-                height=height,
-                seed=unit.seed
-            )
+            # ---- GENERATE ON WORKER ----
+            if has_workers:
+                # Send to worker - worker handles model download
+                yield {
+                    'stage': 'generating',
+                    'pct': pct,
+                    'log': f'🎬 Scene {idx + 1}/{total_scenes}: Sending to worker for generation...',
+                    'gallery': generated_clips,
+                    'video': None,
+                    'model_status': {}
+                }
+                
+                result = worker_client.generate_video_on_worker(
+                    worker_id=worker_client.connected_worker_ids()[0],  # First connected worker
+                    prompt=unit.visual_prompt,
+                    model_id=model_id,
+                    context={},
+                    duration_seconds=duration_per_scene,
+                    fps=fps,
+                    width=width,
+                    height=height,
+                    seed=unit.seed
+                )
+            else:
+                # Fallback: generate locally (will be slow)
+                yield {
+                    'stage': 'generating',
+                    'pct': pct,
+                    'log': f'🎬 Scene {idx + 1}/{total_scenes}: No workers, using local fallback...',
+                    'gallery': generated_clips,
+                    'video': None,
+                    'model_status': {}
+                }
+                
+                # Use local video generation (if available)
+                result = video_models.generate_fallback(
+                    prompt=unit.visual_prompt,
+                    duration=duration_per_scene,
+                    fps=fps,
+                    width=width,
+                    height=height,
+                    seed=unit.seed
+                )
             
             # Add to gallery
             clip_entry = {
                 'scene_id': unit.scene_id,
                 'description': unit.description,
-                'video_data': result['video_data'],
-                'duration': result['duration']
+                'video_data': result.get('video_data', ''),
+                'duration': result.get('duration', duration_per_scene)
             }
             generated_clips.append(clip_entry)
             
@@ -159,7 +173,7 @@ def run_video_pipeline(
                 'log': f'❌ Scene {idx + 1} failed: {e}',
                 'gallery': generated_clips,
                 'video': None,
-                'model_status': model_manager.get_vram_status()
+                'model_status': {}
             }
             continue
     
@@ -172,10 +186,5 @@ def run_video_pipeline(
         'log': f'✅ Complete! Generated {len(generated_clips)} clips.',
         'gallery': generated_clips,
         'video': final_video,
-        'model_status': model_manager.get_vram_status()
+        'model_status': {}
     }
-    
-    # ---- Stage 7: Auto-Cleanup ----
-    # Model stays loaded for potential reuse, but can be unloaded manually
-    # or will be auto-unloaded when space is needed
-    print("✅ Pipeline complete. Model kept in VRAM for reuse.")

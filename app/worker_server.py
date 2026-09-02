@@ -248,103 +248,74 @@ def build_fastapi_app():
             )
 
     # ---- VIDEO GENERATION ENDPOINT - COMPLETE FIX ----
-    @app.post("/video/generate")
-    async def generate_video(request: VideoGenRequest):
-        """Generate video with auto-download and fallback"""
-        try:
-            print(f"🎬 Video Generation Request")
-            print(f"   Model: {request.model_id}")
-            print(f"   Prompt: {request.prompt[:100]}...")
-            print(f"   Duration: {request.duration_seconds}s")
-            print(f"   Seed: {request.seed}")
+    # In the /video/generate endpoint - WORKER downloads the model
 
-            # ---- STEP 1: AUTO-DOWNLOAD if not installed ----
-            if not model_manager.is_installed(request.model_id):
-                print(f"📥 Model not installed. Auto-downloading {request.model_id}...")
-                
-                # Download with progress
-                for pct, msg in model_manager.smart_download_model(request.model_id):
-                    print(f"  [{pct}%] {msg}")
-                
-                print(f"✅ Model downloaded successfully!")
-
-            # ---- STEP 2: Load into VRAM (auto-unloads old models) ----
-            print(f"🔄 Loading model into VRAM...")
-            model_manager.auto_download_and_load_model(request.model_id)
-            print(f"✅ Model loaded into VRAM")
-
-            # ---- STEP 3: Generate video ----
-            print(f"🎬 Generating video...")
+@app.post("/video/generate")
+async def generate_video(request: VideoGenRequest):
+    """Generate video - WORKER downloads model if needed"""
+    try:
+        print(f"🎬 Worker received request")
+        print(f"   Model: {request.model_id}")
+        print(f"   Prompt: {request.prompt[:100]}...")
+        
+        # ---- STEP 1: Worker checks if model is installed ----
+        # This happens on the WORKER, not the main app
+        if not model_manager.is_installed(request.model_id):
+            print(f"📥 Model not installed on worker. Downloading...")
             
-            # Check if video_models has the function
-            if hasattr(video_models, 'generate_video'):
-                result = video_models.generate_video(
-                    prompt=request.prompt,
-                    model_id=request.model_id,
-                    context=request.context,
-                    duration_seconds=request.duration_seconds,
-                    fps=request.fps,
-                    width=request.width,
-                    height=request.height,
-                    seed=request.seed,
-                    reference_image=request.reference_image
-                )
-            else:
-                # Fallback to using the model directly
-                result = _generate_with_model(
-                    request.model_id,
-                    request.prompt,
-                    request.duration_seconds,
-                    request.fps,
-                    request.width,
-                    request.height,
-                    request.seed
-                )
-
-            # ---- STEP 4: Return result ----
-            if result and result.get('video_data'):
-                print(f"✅ Video generated: {len(result['video_data'])} bytes")
-                return result
-            else:
-                raise RuntimeError("Video generation returned empty result")
-
-        except Exception as e:
-            error_msg = f"❌ Video generation failed: {str(e)}"
-            print(error_msg)
-            print(traceback.format_exc())
-
-            # ---- FALLBACK: Use fallback video ----
-            try:
-                print("🔄 Using fallback video...")
-                fallback = video_models._generate_fallback_video(
-                    request.prompt,
-                    request.duration_seconds,
-                    request.fps,
-                    request.width,
-                    request.height,
-                    request.seed
-                )
-                
-                if fallback and fallback.get('video_data'):
-                    fallback['metadata']['error'] = str(e)
-                    fallback['metadata']['note'] = "Fallback video generated"
-                    print(f"✅ Fallback video: {len(fallback['video_data'])} bytes")
-                    return fallback
-            except Exception as fallback_error:
-                print(f"❌ Fallback failed: {fallback_error}")
-
-            # Return error response
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": str(e),
-                    "traceback": traceback.format_exc(),
-                    "model_id": request.model_id,
-                    "prompt": request.prompt[:100]
-                }
+            # Download on worker
+            for pct, msg in model_manager.smart_download_model(request.model_id):
+                print(f"  [{pct}%] {msg}")
+            
+            print(f"✅ Model downloaded on worker!")
+        
+        # ---- STEP 2: Load into VRAM on worker ----
+        print(f"🔄 Loading model into VRAM on worker...")
+        model_manager.auto_download_and_load_model(request.model_id)
+        print(f"✅ Model loaded on worker")
+        
+        # ---- STEP 3: Generate video on worker ----
+        print(f"🎬 Generating video on worker...")
+        result = video_models.generate_video(
+            prompt=request.prompt,
+            model_id=request.model_id,
+            context=request.context,
+            duration_seconds=request.duration_seconds,
+            fps=request.fps,
+            width=request.width,
+            height=request.height,
+            seed=request.seed,
+            reference_image=request.reference_image
+        )
+        
+        print(f"✅ Video generated on worker: {len(result['video_data'])} bytes")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Worker generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback on worker
+        try:
+            fallback = video_models._generate_fallback_video(
+                request.prompt,
+                request.duration_seconds,
+                request.fps,
+                request.width,
+                request.height,
+                request.seed
             )
-
-    return app
+            if fallback and fallback.get('video_data'):
+                print(f"✅ Fallback video on worker")
+                return fallback
+        except:
+            pass
+        
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 
 def _generate_with_model(model_id: str, prompt: str, duration: int, fps: int, width: int, height: int, seed: int) -> Dict[str, Any]:
