@@ -13,6 +13,7 @@ transformers
 diffusers
 accelerate
 huggingface_hub
+bitsandbytes  # 4-bit quantization for the local "brain" LLM on a T4
 
 # Video generation (GPU-heavy)
 # For Stable Video Diffusion
@@ -25,11 +26,6 @@ moviepy
 # For worker-server
 fastapi
 uvicorn
-
-# API clients
-anthropic
-google-generativeai
-openai
 
 # Search and retrieval
 duckduckgo-search

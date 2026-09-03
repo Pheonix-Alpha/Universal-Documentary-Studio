@@ -161,3 +161,63 @@ step (CLIP-ranked reference photos feeding img2vid) that doesn't exist in
 video pipeline. Wiring that up is a real feature addition (fetching images
 per scene, ranking them, passing the best one as `reference_image`), not a
 bug fix, so it's flagged here rather than silently added.
+
+---
+
+## Addendum: local "brain" LLM replaces the Anthropic API
+
+Per a follow-up request, the main Colab now runs its own local LLM instead
+of calling Claude for story analysis / bible generation / script
+enhancement. Anthropic is fully removed — there's no key-set fallback
+branch anymore, only local-LLM-with-a-rule-based-fallback.
+
+- **Model:** `Qwen/Qwen2.5-7B-Instruct`, loaded in 4-bit (nf4, double
+  quantization) via `bitsandbytes`. It's ungated on the Hub (no HF login
+  needed for auto-download, unlike e.g. Llama), and strong at structured
+  JSON output, which every one of these tasks needs. ~15GB on disk in
+  bf16, ~7GB VRAM once quantized — comfortable on a T4's 16GB alongside the
+  small CLIP model used for reference-image ranking.
+- **`app/model_manager.py`**: added `'llm'` as a third model type alongside
+  `'video'`/`'clip'`, with its own registry entry, loader
+  (`_load_llm_model`), and a new public `generate_text(user_prompt,
+  system_prompt, max_new_tokens, temperature)` — the single call site every
+  "brain" task now uses. It rides the exact same
+  `auto_download_and_load_model()` path (download progress, VRAM-aware
+  loading, `_loaded_models` caching, storage cleanup) as video/CLIP models
+  already did, so nothing about the model-management machinery had to be
+  duplicated.
+- **`app/scene_analyzer.py`, `app/query_generator.py`,
+  `app/production_bible.py`, `app/script_enhancer.py`**: the Claude
+  API calls (`import anthropic`, `client.messages.create(...)`) were
+  replaced with `model_manager.generate_text(...)` calls. Each still falls
+  back to its rule-based logic on any failure (JSON parse error, no GPU,
+  etc.) rather than crashing.
+- **`app/config.py`**: removed the `ANTHROPIC_API_KEY` entry from
+  `KEY_SPECS` (and the now-dead `config.ANTHROPIC_API_KEY` constant) — there's
+  nothing left that reads it.
+- **`requirements.txt`**: dropped `anthropic`; added `bitsandbytes`. Also
+  dropped `google-generativeai`/`openai`, which were listed but never
+  actually imported anywhere in the codebase.
+- **`app/pipeline.py`**: added a `brain_loading` stage before bible
+  generation that streams real download/load progress for the local LLM on
+  first use (via the same `smart_download_model()` generator video models
+  use) — the ~15GB first-run download otherwise happened silently inside
+  what looked like a single "Creating production bible..." step.
+- **Bonus catch**: while wiring this up I found a *second*, previously
+  missed instance of the `people.split(',')` list-vs-string bug (item 6
+  above), in `production_bible._enrich_scenes_with_bible` this time (the
+  earlier pass only caught it in the character-extraction fallback loop and
+  in `scene_orchestrator.py`). Fixed the same way — routed through the
+  shared `_scene_people()` helper.
+
+**Verified:** module imports, and a full pipeline run with
+`model_manager.generate_text` stubbed to return realistic Qwen-shaped JSON
+(scene list, full bible with characters/locations/visual style, "enhanced"
+script, search queries) — this exercises every call site's JSON parsing end
+to end without needing to actually download/run a 7B model in the sandbox
+used to make these changes. The actual 4-bit loading code
+(`BitsAndBytesConfig`, `device_map`, `apply_chat_template`) follows the
+standard `transformers`/`bitsandbytes` pattern but could only be
+type/logic-checked here, not executed against real weights — worth a real
+smoke test on an actual T4 Colab before you rely on it.
+

@@ -69,8 +69,24 @@ MODEL_REGISTRY = {
         'size_gb': 1.7,
         'description': 'Better CLIP model',
         'vram_gb': 4.0
+    },
+    # Local "brain" LLM -- replaces the Claude API entirely. Runs on the
+    # MAIN Colab's own T4 (never sent to a worker), loaded once in 4-bit and
+    # kept resident for the whole session. Ungated on the Hub (no HF login
+    # needed for auto-download), and strong at structured JSON output,
+    # which is what scene analysis / bible generation / script enhancement
+    # all need.
+    'Qwen/Qwen2.5-7B-Instruct': {
+        'name': 'Qwen2.5-7B-Instruct (local brain)',
+        'type': 'llm',
+        'size_gb': 15.0,   # bf16 weights on disk
+        'description': 'Local LLM for story analysis, bible generation, and script enhancement',
+        'vram_gb': 7.0     # loaded in 4-bit (nf4) -- leaves headroom on a 16GB T4
     }
 }
+
+# The single model used as "the brain" everywhere Claude used to be called.
+LOCAL_BRAIN_MODEL_ID = 'Qwen/Qwen2.5-7B-Instruct'
 
 # Maximum storage (Colab: ~70GB, keep 10GB buffer)
 MAX_STORAGE_GB = 60.0
@@ -410,8 +426,11 @@ def _load_model_into_vram(model_id: str, device: str) -> Any:
         return _load_video_model(model_id, device)
     elif model_info['type'] == 'clip':
         return _load_clip_model(model_id, device)
+    elif model_info['type'] == 'llm':
+        return _load_llm_model(model_id, device)
     else:
         raise ValueError(f"Unknown model type: {model_info['type']}")
+
 
 
 def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
@@ -457,6 +476,7 @@ def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
 
 
 
+
 def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
     """Load CLIP model"""
     from transformers import CLIPModel, CLIPProcessor
@@ -475,6 +495,88 @@ def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
     processor = CLIPProcessor.from_pretrained(model_path)
     
     return {'model': model, 'processor': processor, 'device': device}
+
+
+def _load_llm_model(model_id: str, device: str) -> Dict[str, Any]:
+    """Load the local "brain" LLM. On CUDA this loads in 4-bit (nf4, double
+    quantization) via bitsandbytes so a 7B-class model fits comfortably on a
+    single T4's 16GB, alongside the small CLIP model used for reference
+    image ranking. Falls back to plain fp32 on CPU (slow, but functional --
+    e.g. for local testing without a GPU)."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_path = get_model_path(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    if device == 'cuda':
+        from transformers import BitsAndBytesConfig
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            quantization_config=quant_config,
+            device_map={"": 0},
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        model.to(device)
+
+    model.eval()
+    return {'model': model, 'tokenizer': tokenizer, 'device': device}
+
+
+def generate_text(
+    user_prompt: str,
+    system_prompt: str = "",
+    max_new_tokens: int = 2048,
+    temperature: float = 0.4,
+    model_id: str = LOCAL_BRAIN_MODEL_ID,
+) -> str:
+    """The single entry point every "brain" task (scene analysis, bible
+    generation, script enhancement, search-query generation) calls instead
+    of hitting the Anthropic API. Auto-downloads/loads the local LLM (via
+    the same auto_download_and_load_model() path video/CLIP models use, so
+    it gets the same VRAM-aware loading, caching, and storage cleanup) and
+    runs a single chat completion."""
+    loaded = auto_download_and_load_model(model_id)
+    model = loaded['model']
+    tokenizer = loaded['tokenizer']
+    device = loaded['device']
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device if device == 'cuda' else device)
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=max(temperature, 0.01),
+            top_p=0.9,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+
+    new_tokens = output_ids[0][inputs['input_ids'].shape[1]:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+    _update_last_used(model_id)
+    return text.strip()
 
 
 def _unload_unused_models(keep: List[str] = None):

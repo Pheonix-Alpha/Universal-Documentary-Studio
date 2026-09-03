@@ -1,7 +1,7 @@
 """Scene dict -> list of 3-4 image-search query strings."""
 import json
 
-from app import config
+from app import model_manager
 from app.scene_analyzer import _strip_code_fence
 
 
@@ -28,10 +28,9 @@ def _fallback_queries(scene: dict):
     return queries[:4]
 
 
-def _generate_with_claude(scene: dict):
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=config.get_key("ANTHROPIC_API_KEY"))
+def _generate_with_local_brain(scene: dict):
+    """Uses the local LLM (see model_manager.generate_text) instead of the
+    Anthropic API."""
     prompt = (
         "Given this scene JSON, write 3-4 short, specific image-search queries "
         "that would find historically/factually accurate photos for it "
@@ -39,21 +38,20 @@ def _generate_with_claude(scene: dict):
         "Return ONLY a JSON list of strings, nothing else.\n\n"
         f"Scene:\n{json.dumps(scene)}"
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
+    text = model_manager.generate_text(
+        user_prompt=prompt,
+        system_prompt="You write concise, specific image-search queries. Output only a JSON list of strings.",
+        max_new_tokens=300,
+        temperature=0.3,
     )
-    text = "".join(b.text for b in resp.content if hasattr(b, "text"))
     return json.loads(_strip_code_fence(text))
 
 
 def generate_queries(scene: dict):
-    if config.is_key_set("ANTHROPIC_API_KEY"):
-        try:
-            qs = _generate_with_claude(scene)
-            if qs:
-                return qs
-        except Exception as e:  # noqa: BLE001
-            print(f"[query_generator] Claude query generation failed, falling back: {e}")
+    try:
+        qs = _generate_with_local_brain(scene)
+        if qs:
+            return qs
+    except Exception as e:  # noqa: BLE001
+        print(f"[query_generator] Local brain query generation failed, falling back: {e}")
     return _fallback_queries(scene)

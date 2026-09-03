@@ -2,7 +2,7 @@
 import json
 import re
 
-from app import config
+from app import model_manager
 
 
 def _fallback_scene_split(story: str):
@@ -36,10 +36,10 @@ def _strip_code_fence(text: str) -> str:
     return text.strip()
 
 
-def _analyze_with_claude(story: str):
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=config.get_key("ANTHROPIC_API_KEY"))
+def _analyze_with_local_brain(story: str):
+    """Uses the local LLM running on the main Colab's own GPU (see
+    model_manager.generate_text) instead of the Anthropic API -- no key,
+    no external call."""
     prompt = (
         "Break the following story into scenes for an image storyboard. "
         "For each scene extract any people, location, year and event mentioned "
@@ -49,19 +49,18 @@ def _analyze_with_claude(story: str):
         "event (string, may be empty). No prose, no markdown fences.\n\n"
         f"Story:\n{story}"
     )
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
+    text = model_manager.generate_text(
+        user_prompt=prompt,
+        system_prompt="You are a scene-breakdown assistant. Output only valid JSON.",
+        max_new_tokens=2000,
+        temperature=0.2,
     )
-    text = "".join(b.text for b in resp.content if hasattr(b, "text"))
     return json.loads(_strip_code_fence(text))
 
 
 def analyze_story(story: str):
-    if config.is_key_set("ANTHROPIC_API_KEY"):
-        try:
-            return _analyze_with_claude(story)
-        except Exception as e:  # noqa: BLE001
-            print(f"[scene_analyzer] Claude analysis failed, falling back to rule-based split: {e}")
+    try:
+        return _analyze_with_local_brain(story)
+    except Exception as e:  # noqa: BLE001
+        print(f"[scene_analyzer] Local brain analysis failed, falling back to rule-based split: {e}")
     return _fallback_scene_split(story)

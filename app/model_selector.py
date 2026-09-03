@@ -13,10 +13,11 @@ Design, matching the requested flow:
 The main Colab ("the director"/"the brain") NEVER downloads a heavy video
 model itself -- it only inspects a connected worker's reported VRAM/storage
 (via GET /health) and its installed models (via GET /models), decides which
-model_id best fits, and tells the worker to use it. Only small supervisory
-things (Claude API calls for the bible/script, and optionally a local CLIP
-model for reference-image ranking when no worker is connected -- see
-compute.py) ever run on the main Colab.
+model_id best fits, and tells the worker to use it. The only things that
+ever run locally on the main Colab are small supervisory jobs: the local
+"brain" LLM (model_manager.generate_text) for the bible/script, and
+optionally a local CLIP model for reference-image ranking when no worker is
+connected (see compute.py).
 """
 from typing import Any, List, Optional, Dict
 

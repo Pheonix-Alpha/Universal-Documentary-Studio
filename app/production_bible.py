@@ -10,13 +10,13 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
-from app import config
+from app import model_manager
 from app.scene_analyzer import analyze_story, _strip_code_fence
 
 
 def _scene_people(scene: Dict) -> List[str]:
-    """scene['people'] is a list of names when scenes come from Claude
-    (see scene_analyzer._analyze_with_claude's prompt), but code elsewhere
+    """scene['people'] is a list of names when scenes come from the local
+    LLM (see scene_analyzer._analyze_with_local_brain's prompt), but code elsewhere
     in this file used to assume it was a comma-separated string and called
     .split(',') on it -- which raises AttributeError on a real list. Accept
     either shape."""
@@ -122,10 +122,11 @@ class ProductionBible:
         return result
 
 
-def generate_production_bible(story: str, use_claude: bool = True) -> ProductionBible:
+def generate_production_bible(story: str, use_local_brain: bool = True) -> ProductionBible:
     """
     Generate a complete production bible from a story.
-    This is the main entry point for the "Director's Brain".
+    This is the main entry point for the "Director's Brain" -- which is now
+    the local LLM running on the main Colab's own GPU, not the Anthropic API.
     """
     bible = ProductionBible()
     
@@ -134,8 +135,8 @@ def generate_production_bible(story: str, use_claude: bool = True) -> Production
     bible.scenes = scenes
     
     # Step 2: Extract characters, locations, and themes
-    if use_claude and config.is_key_set('ANTHROPIC_API_KEY'):
-        bible = _generate_bible_with_claude(story, bible)
+    if use_local_brain:
+        bible = _generate_bible_with_local_brain(story, bible)
     else:
         bible = _generate_bible_fallback(story, bible)
     
@@ -145,16 +146,10 @@ def generate_production_bible(story: str, use_claude: bool = True) -> Production
     return bible
 
 
-def _generate_bible_with_claude(story: str, bible: ProductionBible) -> ProductionBible:
-    """Use Claude to generate a comprehensive bible"""
-    import anthropic
-    
-    api_key = config.get_key('ANTHROPIC_API_KEY')
-    if not api_key:
-        return bible
-    
-    client = anthropic.Anthropic(api_key=api_key)
-    
+def _generate_bible_with_local_brain(story: str, bible: ProductionBible) -> ProductionBible:
+    """Use the local LLM (model_manager.generate_text) to generate a
+    comprehensive bible. Falls back to the rule-based bible on any failure
+    (e.g. no GPU available) rather than leaving the bible empty."""
     prompt = f"""
 You are a master documentary film producer. Analyze this story and create a detailed production bible.
 
@@ -202,15 +197,12 @@ Extract ALL characters and locations mentioned. If not specified, infer from con
     """
     
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
+        content = model_manager.generate_text(
+            user_prompt=prompt,
+            system_prompt="You are a production bible generator. Output only valid JSON.",
+            max_new_tokens=4096,
             temperature=0.3,
-            system="You are a production bible generator. Output only valid JSON.",
-            messages=[{"role": "user", "content": prompt}]
         )
-        
-        content = "".join(b.text for b in response.content if hasattr(b, "text"))
         data = json.loads(_strip_code_fence(content))
         
         # Populate the bible
@@ -257,7 +249,8 @@ Extract ALL characters and locations mentioned. If not specified, infer from con
         )
         
     except Exception as e:
-        print(f"Claude bible generation failed: {e}")
+        print(f"[production_bible] Local brain bible generation failed, falling back to rule-based bible: {e}")
+        return _generate_bible_fallback(story, bible)
     
     return bible
 
@@ -292,11 +285,10 @@ def _enrich_scenes_with_bible(scenes: List[Dict], bible: ProductionBible) -> Lis
         enhanced = dict(scene)
         
         # Add character details
-        people = scene.get('people', '')
+        people = _scene_people(scene)
         if people:
             char_descriptions = []
-            for person in people.split(','):
-                name = person.strip()
+            for name in people:
                 if name in bible.characters:
                     char = bible.characters[name]
                     char_descriptions.append(f"{name}: {char.appearance or char.role}")

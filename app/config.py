@@ -10,21 +10,19 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # --------------------------------------------------------------------------
 # API keys
 #
-# Every key starts out seeded from its environment variable (handy for
-# `os.environ["ANTHROPIC_API_KEY"] = "..."` in a Colab cell before
-# launching), but can also be entered live from the "API Keys" tab in the
-# UI. Other modules must read these via get_key()/is_key_set() at the point
-# of use -- NOT `from app.config import ANTHROPIC_API_KEY` -- so a key
-# entered in the UI takes effect immediately without restarting the app.
+# Every key starts out seeded from its environment variable, but can also be
+# entered live from the "API Keys" tab in the UI. Other modules must read
+# these via get_key()/is_key_set() at the point of use -- NOT
+# `from app.config import SOME_KEY` -- so a key entered in the UI takes
+# effect immediately without restarting the app.
+#
+# NOTE: there is deliberately no Anthropic/Claude key here anymore. Story
+# analysis, production-bible generation, and script enhancement now run on
+# a local LLM loaded on the main Colab's own GPU (see
+# model_manager.generate_text / model_manager.LOCAL_BRAIN_MODEL_ID) instead
+# of calling out to the Anthropic API.
 # --------------------------------------------------------------------------
 KEY_SPECS = [
-    {
-        "id": "ANTHROPIC_API_KEY",
-        "label": "Anthropic",
-        "note": "Smarter scene splitting & search-query generation via Claude. "
-                "Falls back to rule-based logic without it.",
-        "signup_url": "https://console.anthropic.com/settings/keys",
-    },
     {
         "id": "UNSPLASH_ACCESS_KEY",
         "label": "Unsplash",
@@ -71,7 +69,6 @@ def is_key_set(key_id: str) -> bool:
 # Snapshot constants kept for backwards compatibility. NOTE: these only
 # reflect the environment variable at import time -- code that should react
 # to a key entered later in the UI must call get_key()/is_key_set() instead.
-ANTHROPIC_API_KEY = _keys["ANTHROPIC_API_KEY"]
 UNSPLASH_ACCESS_KEY = _keys["UNSPLASH_ACCESS_KEY"]
 FLICKR_API_KEY = _keys["FLICKR_API_KEY"]
 PEXELS_API_KEY = _keys["PEXELS_API_KEY"]

@@ -63,12 +63,29 @@ def run_video_pipeline(
             'video': None,
             'model_status': {}
         }
-    
+
+    # ---- Stage 2b: Make sure the local "brain" LLM is ready ----
+    # First run on a fresh Colab downloads ~15GB and 4-bit-quantizes it into
+    # VRAM, which can take a few minutes -- stream real progress instead of
+    # leaving the UI looking stuck during "Creating production bible...".
+    # Subsequent runs in the same session are instant (model_manager caches
+    # it in _loaded_models).
+    if not model_manager.is_installed(model_manager.LOCAL_BRAIN_MODEL_ID):
+        for pct, msg in model_manager.smart_download_model(model_manager.LOCAL_BRAIN_MODEL_ID):
+            yield {
+                'stage': 'brain_loading',
+                'pct': 6 + (pct / 100) * 3,  # 6-9%
+                'log': f'🧠 {msg}',
+                'gallery': [],
+                'video': None,
+                'model_status': {}
+            }
+
     # ---- Stage 3: Generate Production Bible ----
     yield {
         'stage': 'bible',
         'pct': 10,
-        'log': '📖 Creating production bible...',
+        'log': '📖 Creating production bible (local brain)...',
         'gallery': [],
         'video': None,
         'model_status': {}
