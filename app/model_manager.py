@@ -417,20 +417,17 @@ def _load_model_into_vram(model_id: str, device: str) -> Any:
 def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
     """Load video model"""
     from diffusers import DiffusionPipeline
-    
     model_path = get_model_path(model_id)
     if not os.path.exists(model_path):
         raise ValueError(f"Model not downloaded: {model_id}")
-    
-    dtype = torch.float16 if device == 'cuda' else torch.float32
-    
-    # Special handling for different models
-    if 'stable-video-diffusion' in model_id:
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    # Special handling for Stable Video Diffusion
+    if "stable-video-diffusion" in model_id:
         from diffusers import StableVideoDiffusionPipeline
         pipe = StableVideoDiffusionPipeline.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            variant="fp16" if device == 'cuda' else None,
+            variant="fp16" if device == "cuda" else None,
             low_cpu_mem_usage=True
         )
     else:
@@ -439,16 +436,25 @@ def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
             torch_dtype=dtype,
             low_cpu_mem_usage=True
         )
-    
-    # Enable optimizations
-    if device == 'cuda':
+    # GPU optimizations
+    if device == "cuda":
+        # Helps reduce attention memory usage
         pipe.enable_attention_slicing()
-        pipe.enable_sequential_cpu_offload()
-    
-    pipe.to(device)
+
+        # IMPORTANT:
+        # Do NOT use enable_sequential_cpu_offload()
+        # because we are moving the pipeline directly to GPU.
+
+    # Move the entire pipeline to GPU
+    pipe = pipe.to(device)
+
     pipe.eval()
-    
-    return {'pipeline': pipe, 'device': device}
+
+    return {
+        "pipeline": pipe,
+        "device": device
+    }
+
 
 
 def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:
