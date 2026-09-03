@@ -35,7 +35,11 @@ def launch_app():
     
     print("🚀 Launching Universal Documentary Studio...")
     demo = build_app()
-    demo.queue(max_size=20).launch(share=True, debug=False, theme=gr.themes.Soft())
+    # gr.Blocks.launch() has no `theme` kwarg -- the theme is set once, at
+    # Blocks(...) construction time inside build_app(). Passing it here
+    # raised "TypeError: launch() got an unexpected keyword argument
+    # 'theme'" and crashed on every startup.
+    demo.queue(max_size=20).launch(share=True, debug=False)
 
 
 def main():

@@ -14,6 +14,18 @@ from app import config
 from app.scene_analyzer import analyze_story, _strip_code_fence
 
 
+def _scene_people(scene: Dict) -> List[str]:
+    """scene['people'] is a list of names when scenes come from Claude
+    (see scene_analyzer._analyze_with_claude's prompt), but code elsewhere
+    in this file used to assume it was a comma-separated string and called
+    .split(',') on it -- which raises AttributeError on a real list. Accept
+    either shape."""
+    people = scene.get('people', [])
+    if isinstance(people, str):
+        return [p.strip() for p in people.split(',') if p.strip()]
+    return [p.strip() for p in (people or []) if p and p.strip()]
+
+
 @dataclass
 class Character:
     """A character in the production"""
@@ -122,7 +134,7 @@ def generate_production_bible(story: str, use_claude: bool = True) -> Production
     bible.scenes = scenes
     
     # Step 2: Extract characters, locations, and themes
-    if use_claude and config.is_key_set('anthropic'):
+    if use_claude and config.is_key_set('ANTHROPIC_API_KEY'):
         bible = _generate_bible_with_claude(story, bible)
     else:
         bible = _generate_bible_fallback(story, bible)
@@ -137,7 +149,7 @@ def _generate_bible_with_claude(story: str, bible: ProductionBible) -> Productio
     """Use Claude to generate a comprehensive bible"""
     import anthropic
     
-    api_key = config.get_key('anthropic')
+    api_key = config.get_key('ANTHROPIC_API_KEY')
     if not api_key:
         return bible
     
@@ -191,14 +203,14 @@ Extract ALL characters and locations mentioned. If not specified, infer from con
     
     try:
         response = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-sonnet-4-6",
             max_tokens=4096,
             temperature=0.3,
             system="You are a production bible generator. Output only valid JSON.",
             messages=[{"role": "user", "content": prompt}]
         )
         
-        content = response.content[0].text
+        content = "".join(b.text for b in response.content if hasattr(b, "text"))
         data = json.loads(_strip_code_fence(content))
         
         # Populate the bible
@@ -255,16 +267,13 @@ def _generate_bible_fallback(story: str, bible: ProductionBible) -> ProductionBi
     # Extract characters from scenes
     all_chars = set()
     for scene in bible.scenes:
-        people = scene.get('people', '')
-        if people:
-            for person in people.split(','):
-                name = person.strip()
-                if name and name not in all_chars:
-                    all_chars.add(name)
-                    bible.characters[name] = Character(
-                        name=name,
-                        role='supporting'
-                    )
+        for name in _scene_people(scene):
+            if name not in all_chars:
+                all_chars.add(name)
+                bible.characters[name] = Character(
+                    name=name,
+                    role='supporting'
+                )
     
     # Extract locations
     for scene in bible.scenes:

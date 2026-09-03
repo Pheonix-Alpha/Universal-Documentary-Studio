@@ -12,6 +12,7 @@ from app import (
     worker_client,
     video_models,
     model_manager,
+    model_selector,
     scene_analyzer,
     script_enhancer
 )
@@ -19,16 +20,23 @@ from app import (
 
 def run_video_pipeline(
     story: str,
-    model_id: str,
+    model_id: str = "auto",
     duration_per_scene: int = 4,
     auto_download: bool = True,
     fps: int = 24,
     width: int = 576,
-    height: int = 320
+    height: int = 320,
+    quality_preference: str = "auto"
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Run complete video pipeline.
-    Models download on workers, not main.
+
+    model_id: either an explicit model id from model_manager.MODEL_REGISTRY,
+    or "auto" (default, recommended) to let model_selector pick the best
+    model for the job and the connected worker's resources.
+
+    Models download on workers, not main -- the main Colab only ever
+    supervises: it picks the model and tells the worker which one to use.
     """
     
     # ---- Stage 1: Validate ----
@@ -69,6 +77,16 @@ def run_video_pipeline(
     try:
         bible = production_bible.generate_production_bible(story)
         enhanced_story = script_enhancer.enhance_script(story, bible)
+
+        # The enhanced script used to be computed and then thrown away --
+        # bible.scenes stayed based on the original, unenhanced story. If
+        # enhancement actually changed the text, re-run scene analysis on
+        # the enhanced version and re-enrich with the same bible context, so
+        # scene descriptions/dialogue actually reflect the improved script.
+        if enhanced_story and enhanced_story.strip() != story.strip():
+            bible.scenes = production_bible._enrich_scenes_with_bible(
+                scene_analyzer.analyze_story(enhanced_story), bible
+            )
     except Exception as e:
         yield {
             'stage': 'error',
@@ -93,7 +111,41 @@ def run_video_pipeline(
     orchestrator = scene_orchestrator.SceneOrchestrator(bible)
     production_units = orchestrator.breakdown()
     total_scenes = len(production_units)
-    
+    consistency = consistency_manager.ConsistencyManager(bible)
+
+    # ---- Stage 4b: Auto-select the best video model for this job ----
+    worker_id = worker_client.connected_worker_ids()[0] if has_workers else None
+    chosen_model_id = (
+        model_selector.select_video_model(production_units, worker_id, quality_preference)
+        if model_id in (None, "", "auto")
+        else model_id
+    )
+    model_status = model_selector.describe_selection(chosen_model_id, worker_id)
+
+    yield {
+        'stage': 'model_select',
+        'pct': 25,
+        'log': f"🧠 Selected model: {model_status['selected_model_name']} "
+               f"({'worker ' + worker_id if worker_id else 'local fallback'})",
+        'gallery': [],
+        'video': None,
+        'model_status': model_status
+    }
+
+    if worker_id:
+        # Only one heavy video model stays resident on a worker at a time --
+        # delete whatever else is installed there before asking it to
+        # install the one we just picked.
+        yield {
+            'stage': 'model_select',
+            'pct': 27,
+            'log': f"🧹 Making sure only {model_status['selected_model_name']} is installed on the worker...",
+            'gallery': [],
+            'video': None,
+            'model_status': model_status
+        }
+        worker_client.switch_video_model(worker_id, chosen_model_id)
+
     # ---- Stage 5: Generate Videos on Workers ----
     generated_clips = []
     
@@ -106,27 +158,30 @@ def run_video_pipeline(
             'log': f'🎬 Scene {idx + 1}/{total_scenes}: {unit.description[:50]}...',
             'gallery': generated_clips,
             'video': None,
-            'model_status': {}
+            'model_status': model_status
         }
         
         try:
             # ---- GENERATE ON WORKER ----
             if has_workers:
-                # Send to worker - worker handles model download
+                # Send to worker - worker handles model download. Also send
+                # the bible-derived consistency context (characters,
+                # locations, style, seeds) instead of an empty dict, so
+                # workers can actually keep scenes visually consistent.
                 yield {
                     'stage': 'generating',
                     'pct': pct,
                     'log': f'🎬 Scene {idx + 1}/{total_scenes}: Sending to worker for generation...',
                     'gallery': generated_clips,
                     'video': None,
-                    'model_status': {}
+                    'model_status': model_status
                 }
                 
                 result = worker_client.generate_video_on_worker(
-                    worker_id=worker_client.connected_worker_ids()[0],  # First connected worker
+                    worker_id=worker_id,
                     prompt=unit.visual_prompt,
-                    model_id=model_id,
-                    context={},
+                    model_id=chosen_model_id,
+                    context=consistency.get_worker_context(unit),
                     duration_seconds=duration_per_scene,
                     fps=fps,
                     width=width,
@@ -134,14 +189,16 @@ def run_video_pipeline(
                     seed=unit.seed
                 )
             else:
-                # Fallback: generate locally (will be slow)
+                # Fallback: generate locally (will be slow, and never a
+                # heavy diffusion model -- the main Colab only ever runs the
+                # lightweight placeholder generator itself).
                 yield {
                     'stage': 'generating',
                     'pct': pct,
                     'log': f'🎬 Scene {idx + 1}/{total_scenes}: No workers, using local fallback...',
                     'gallery': generated_clips,
                     'video': None,
-                    'model_status': {}
+                    'model_status': model_status
                 }
                 
                 # Use local video generation (if available)
@@ -173,7 +230,7 @@ def run_video_pipeline(
                 'log': f'❌ Scene {idx + 1} failed: {e}',
                 'gallery': generated_clips,
                 'video': None,
-                'model_status': {}
+                'model_status': model_status
             }
             continue
     
@@ -186,5 +243,5 @@ def run_video_pipeline(
         'log': f'✅ Complete! Generated {len(generated_clips)} clips.',
         'gallery': generated_clips,
         'video': final_video,
-        'model_status': {}
+        'model_status': model_status
     }

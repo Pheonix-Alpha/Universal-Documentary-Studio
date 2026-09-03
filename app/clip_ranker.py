@@ -10,7 +10,10 @@ from app import model_manager as mm
 _loaded = {}
 
 
-def _load_clip(model_id: str = "clip-vit-b-32"):
+DEFAULT_CLIP_MODEL_ID = "openai/clip-vit-base-patch32"  # must match a key in model_manager.MODEL_REGISTRY
+
+
+def _load_clip(model_id: str = DEFAULT_CLIP_MODEL_ID):
     if model_id in _loaded:
         return _loaded[model_id]
     if not mm.is_installed(model_id):
@@ -52,7 +55,7 @@ def _extract_embedding(output, *primary_attrs):
     raise TypeError(f"Could not extract an embedding tensor from {type(output)}")
 
 
-def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5):
+def rank_candidates(text: str, candidates: list, model_id: str = DEFAULT_CLIP_MODEL_ID, top_k: int = 5):
     """Returns the top_k candidates, each with an added 'score' (cosine
     similarity, -1..1) and 'image' (PIL.Image, used for both CLIP scoring
     and gallery/thumbnail display). Video candidates are scored via their

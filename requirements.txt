@@ -1,5 +1,8 @@
 # Core
-gradio>=4.0.0
+# Pinned below 6.0: Gradio 6 moved `theme=` from Blocks(...) to .launch(...),
+# so an unbounded version here could silently start ignoring the theme (or
+# worse, break) depending on when `pip install` resolves it in a fresh Colab.
+gradio>=4.0.0,<6.0.0
 numpy
 Pillow
 requests

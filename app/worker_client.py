@@ -233,7 +233,106 @@ def list_video_models_on_worker(worker_id: str) -> List[Dict[str, Any]]:
         response = requests.get(f"{worker['url']}/models", timeout=5)
         if response.status_code == 200:
             data = response.json()
-            return data.get('models', [])
+            return data.get('video_models', [])
     except Exception:
         pass
     return []
+
+
+def list_models(worker_id: str) -> List[Dict[str, Any]]:
+    """List ALL models (video + clip, per model_manager's registry) known
+    to a specific worker, each with its installed status. This is what
+    compute.py's list_models()/is_installed() call -- it was previously
+    missing entirely, which made every call to compute.py crash with an
+    AttributeError as soon as a worker was connected."""
+    worker = _workers.get(worker_id)
+    if not worker:
+        return []
+
+    try:
+        response = requests.get(f"{worker['url']}/models", timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data.get('models', [])
+    except Exception as e:
+        print(f"[worker_client] list_models failed for {worker_id}: {e}")
+        return []
+
+
+def rank_candidates_on_worker(
+    worker_id: str,
+    text: str,
+    candidates: List[Dict[str, Any]],
+    model_id: str,
+    top_k: int = 5,
+    timeout: int = 60,
+) -> List[Dict[str, Any]]:
+    """Call a single worker's /rank endpoint."""
+    worker = _workers.get(worker_id)
+    if not worker:
+        raise ValueError(f"Worker {worker_id} not found")
+
+    response = requests.post(
+        f"{worker['url']}/rank",
+        json={"text": text, "candidates": candidates, "model_id": model_id, "top_k": top_k},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def rank_candidates_round_robin(
+    text: str,
+    candidates: List[Dict[str, Any]],
+    model_id: str,
+    top_k: int = 5,
+    max_retries: int = 3,
+) -> List[Dict[str, Any]]:
+    """Rank candidates using workers in round-robin fashion (mirrors
+    generate_video_round_robin). This was referenced by compute.py but
+    never defined, so any ranking call crashed with an AttributeError as
+    soon as a worker was connected."""
+    connected = connected_worker_ids()
+    if not connected:
+        raise RuntimeError("No connected workers available")
+
+    for attempt in range(max_retries):
+        worker_id = connected[next(_rr_counter) % len(connected)]
+        try:
+            return rank_candidates_on_worker(worker_id, text, candidates, model_id, top_k)
+        except Exception as e:
+            print(f"Worker {worker_id} failed to rank: {e}")
+            if worker_id in connected:
+                connected.remove(worker_id)
+            if not connected:
+                break
+            continue
+
+    raise RuntimeError("All workers failed to rank candidates")
+
+
+def switch_video_model(worker_id: str, new_model_id: str) -> None:
+    """Delete every OTHER installed video model on this worker before we
+    ask it to install `new_model_id`. Colab disks are small and shared with
+    the rest of the runtime, so we keep at most one heavy video model
+    resident at a time instead of relying only on the reactive
+    "clean up when we run out of space" path in smart_download_model.
+    CLIP/text models are left alone -- they're small and may still be
+    needed for reference-image ranking."""
+    worker = _workers.get(worker_id)
+    if not worker:
+        return
+
+    try:
+        models = list_models(worker_id)
+    except Exception as e:
+        print(f"[worker_client] switch_video_model: could not list models on {worker_id}: {e}")
+        return
+
+    for m in models:
+        if m.get('type') == 'video' and m.get('installed') and m.get('id') != new_model_id:
+            try:
+                print(f"🧹 Deleting {m['id']} on {worker_id} to make room for {new_model_id}")
+                requests.delete(f"{worker['url']}/models/{m['id']}", timeout=60)
+            except Exception as e:
+                print(f"[worker_client] switch_video_model: failed to delete {m['id']} on {worker_id}: {e}")

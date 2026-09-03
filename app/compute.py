@@ -11,6 +11,8 @@ from app import clip_ranker
 from app import model_manager as local_mm
 from app import worker_client
 
+DEFAULT_CLIP_MODEL_ID = clip_ranker.DEFAULT_CLIP_MODEL_ID
+
 
 def backend_name() -> str:
     """'worker' if at least one worker is connected and reachable right
@@ -49,7 +51,7 @@ def is_installed(model_id: str) -> bool:
     return False
 
 
-def rank_candidates(text: str, candidates: list, model_id: str = "clip-vit-b-32", top_k: int = 5):
+def rank_candidates(text: str, candidates: list, model_id: str = DEFAULT_CLIP_MODEL_ID, top_k: int = 5):
     if backend_name() == "worker":
         return worker_client.rank_candidates_round_robin(text, candidates, model_id=model_id, top_k=top_k)
     return clip_ranker.rank_candidates(text, candidates, model_id=model_id, top_k=top_k)

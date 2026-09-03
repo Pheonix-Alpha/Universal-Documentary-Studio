@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 import hashlib
 
-from app.production_bible import ProductionBible
+from app.production_bible import ProductionBible, _scene_people
 
 
 @dataclass
@@ -53,11 +53,11 @@ class SceneOrchestrator:
         # Generate a comprehensive visual prompt
         visual_prompt = self._generate_visual_prompt(scene)
         
-        # Extract characters
-        characters = []
-        people = scene.get('people', '')
-        if people:
-            characters = [p.strip() for p in people.split(',')]
+        # Extract characters. scene['people'] may be a list (Claude path) or
+        # a comma-separated string (older fallback shape) -- _scene_people
+        # handles both; calling .split(',') directly on a list here used to
+        # raise AttributeError as soon as Claude-based scene analysis was on.
+        characters = _scene_people(scene)
         
         unit = ProductionUnit(
             scene_id=scene_id,

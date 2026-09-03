@@ -13,7 +13,7 @@ def enhance_script(story: str, bible: ProductionBible) -> str:
     """
     Enhance the script with better dialogue, pacing, and narrative flow.
     """
-    if config.is_key_set('anthropic'):
+    if config.is_key_set('ANTHROPIC_API_KEY'):
         return _enhance_with_claude(story, bible)
     return _enhance_fallback(story, bible)
 
@@ -21,7 +21,7 @@ def enhance_script(story: str, bible: ProductionBible) -> str:
 def _enhance_with_claude(story: str, bible: ProductionBible) -> str:
     import anthropic
     
-    api_key = config.get_key('anthropic')
+    api_key = config.get_key('ANTHROPIC_API_KEY')
     if not api_key:
         return story
     
@@ -54,13 +54,13 @@ Return the enhanced script as plain text. Keep the same events and scenes.
     
     try:
         response = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-sonnet-4-6",
             max_tokens=4096,
             temperature=0.5,
             system="You are a documentary script editor. Improve scripts.",
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.content[0].text
+        return "".join(b.text for b in response.content if hasattr(b, "text")) or story
     except Exception as e:
         print(f"Script enhancement failed: {e}")
         return story
