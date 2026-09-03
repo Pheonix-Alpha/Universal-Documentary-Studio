@@ -12,6 +12,8 @@ from PIL import Image, ImageDraw, ImageFont
 import time
 import traceback
 
+from app import model_manager
+
 # Video model registry
 VIDEO_MODEL_REGISTRY = {
     'stabilityai/stable-video-diffusion-img2vid': {
@@ -47,9 +49,8 @@ def list_video_models() -> List[Dict[str, Any]]:
 def is_video_model_installed(model_id: str) -> bool:
     """Check if a video model is installed"""
     try:
-        from app import model_manager
         return model_manager.is_installed(model_id)
-    except:
+    except Exception:
         return False
 
 
@@ -77,15 +78,27 @@ def generate_video(
         # Check if we should use a real model
         if model_id in VIDEO_MODEL_REGISTRY:
             model_info = VIDEO_MODEL_REGISTRY[model_id]
-            
+
+            # Load (or reuse the already-loaded, cached) pipeline through
+            # model_manager -- this used to be a completely separate
+            # load-from-disk-every-call inside _generate_img2vid/
+            # _generate_text2vid below, which re-read the full multi-GB
+            # model off disk for EVERY scene in a documentary instead of
+            # once per worker session. worker_server.py already calls
+            # model_manager.auto_download_and_load_model() right before
+            # this, specifically so it's a cheap cache-hit here.
+            loaded = model_manager.auto_download_and_load_model(model_id)
+            pipe = loaded['pipeline']
+            device = loaded['device']
+
             if model_info['type'] == 'img2vid':
                 result = _generate_img2vid(
-                    prompt, model_id, context, duration_seconds, fps,
+                    pipe, device, prompt, model_id, context, duration_seconds, fps,
                     width, height, seed, reference_image, callback
                 )
             elif model_info['type'] == 'text2vid':
                 result = _generate_text2vid(
-                    prompt, model_id, context, duration_seconds, fps,
+                    pipe, device, prompt, model_id, context, duration_seconds, fps,
                     width, height, seed, callback
                 )
             else:
@@ -108,6 +121,8 @@ def generate_video(
 
 
 def _generate_img2vid(
+    pipe,
+    device: str,
     prompt: str,
     model_id: str,
     context: Dict[str, Any],
@@ -119,34 +134,25 @@ def _generate_img2vid(
     reference_image: Optional[str],
     callback=None
 ) -> Dict[str, Any]:
-    """Generate video using Stable Video Diffusion"""
+    """Generate video using Stable Video Diffusion. `pipe`/`device` come
+    from model_manager's cache (loaded once per worker session, not
+    reloaded from disk here) -- see generate_video() above."""
     try:
-        from diffusers import StableVideoDiffusionPipeline
         from diffusers.utils import load_image
-        
-        model_path = _get_model_path(model_id)
-        
-        # Check if model exists
-        if not os.path.exists(model_path):
-            raise ValueError(f"Model not found at {model_path}")
-        
-        # Load pipeline
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        dtype = torch.float16 if device == 'cuda' else torch.float32
-        
-        pipe = StableVideoDiffusionPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True
-        )
-        
-        if device == 'cuda':
-            pipe.enable_model_cpu_offload()
-            pipe.enable_attention_slicing()
         
         # Load or create reference image
         if reference_image:
-            import base64
+            # NOTE: no `import base64` here -- it's already imported at
+            # module level (top of this file). Re-importing it inside this
+            # `if` block made Python treat `base64` as a local name for the
+            # *whole function* (assignment/import anywhere in a function
+            # makes it local throughout), so when reference_image was falsy
+            # -- the common case -- `base64` was unbound by the time
+            # `base64.b64encode(...)` ran below, raising UnboundLocalError
+            # on every real SVD generation without a reference image. That
+            # exception was swallowed by generate_video()'s broad
+            # try/except, so it silently fell back to the placeholder video
+            # instead of ever actually running the real model.
             from io import BytesIO
             if reference_image.startswith('data:image'):
                 img_data = reference_image.split(',')[1]
@@ -183,6 +189,8 @@ def _generate_img2vid(
 
 
 def _generate_text2vid(
+    pipe,
+    device: str,
     prompt: str,
     model_id: str,
     context: Dict[str, Any],
@@ -193,28 +201,15 @@ def _generate_text2vid(
     seed: int,
     callback=None
 ) -> Dict[str, Any]:
-    """Generate video using text-to-video models"""
+    """Generate video using text-to-video models. `pipe`/`device` come from
+    model_manager's cache -- see generate_video() above. (This also drops
+    the old hardcoded `model_path = 'cerspense/zeroscope_v2_576w'` override
+    for ZeroScope, which bypassed the locally downloaded copy and would
+    have tried to re-download/stream the model straight from the Hub on
+    every call.)"""
     try:
-        from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
-        
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        dtype = torch.float16 if device == 'cuda' else torch.float32
-        
-        # Use ZeroScope if available
-        if 'zeroscope' in model_id.lower():
-            model_path = 'cerspense/zeroscope_v2_576w'
-        else:
-            model_path = _get_model_path(model_id)
-        
-        pipe = DiffusionPipeline.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True
-        )
+        from diffusers import DPMSolverMultistepScheduler
         pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-        
-        if device == 'cuda':
-            pipe.enable_model_cpu_offload()
         
         # Generate
         generator = torch.Generator(device=device).manual_seed(seed)
@@ -340,12 +335,14 @@ def _generate_fallback_video(
 
 
 def _get_model_path(model_id: str) -> str:
-    """Get model path from model_manager"""
+    """Get model path from model_manager. Currently unused internally
+    (generate_video()/​_generate_img2vid/_generate_text2vid now get the
+    already-loaded pipeline straight from model_manager instead of a path
+    to re-load from) but kept as a small public helper in case something
+    outside this module wants the on-disk path."""
     try:
-        from app import model_manager
         return model_manager.get_model_path(model_id)
-    except:
-        # Fallback path
+    except Exception:
         return os.path.join(os.path.expanduser('~'), '.cache', 'models', model_id.replace('/', '__'))
 
 

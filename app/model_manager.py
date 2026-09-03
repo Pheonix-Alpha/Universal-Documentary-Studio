@@ -432,21 +432,20 @@ def _load_model_into_vram(model_id: str, device: str) -> Any:
         raise ValueError(f"Unknown model type: {model_info['type']}")
 
 
-
 def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
     """Load video model"""
     from diffusers import DiffusionPipeline
     model_path = get_model_path(model_id)
     if not os.path.exists(model_path):
         raise ValueError(f"Model not downloaded: {model_id}")
-    dtype = torch.float16 if device == "cuda" else torch.float32
-    # Special handling for Stable Video Diffusion
-    if "stable-video-diffusion" in model_id:
+    dtype = torch.float16 if device == 'cuda' else torch.float32
+    # Special handling for different models
+    if 'stable-video-diffusion' in model_id:
         from diffusers import StableVideoDiffusionPipeline
         pipe = StableVideoDiffusionPipeline.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            variant="fp16" if device == "cuda" else None,
+            variant="fp16" if device == 'cuda' else None,
             low_cpu_mem_usage=True
         )
     else:
@@ -456,25 +455,31 @@ def _load_video_model(model_id: str, device: str) -> Dict[str, Any]:
             low_cpu_mem_usage=True
         )
     # GPU optimizations
-    if device == "cuda":
+    if device == 'cuda':
         # Helps reduce attention memory usage
         pipe.enable_attention_slicing()
 
-        # IMPORTANT:
-        # Do NOT use enable_sequential_cpu_offload()
-        # because we are moving the pipeline directly to GPU.
-
-    # Move the entire pipeline to GPU
+        # IMPORTANT: do NOT also call enable_sequential_cpu_offload() here.
+        # That method takes over device placement itself (moving submodules
+        # to GPU only as each is needed) and explicitly forbids a
+        # subsequent .to(device) call -- doing both raised:
+        #   "ValueError: It seems like you have activated sequential model
+        #    offloading ... attempting to move the pipeline to GPU"
+        # on every single video generation request. Plain attention
+        # slicing + a normal .to(device) is enough headroom for these
+        # model sizes on a T4's 16GB; if VRAM ever gets tight, switch to
+        # pipe.enable_model_cpu_offload() (see video_models.py's older
+        # per-call loader for that pattern) instead of layering both.
+    
     pipe = pipe.to(device)
-
-    pipe.eval()
-
-    return {
-        "pipeline": pipe,
-        "device": device
-    }
-
-
+    # NOTE: diffusers' DiffusionPipeline/StableVideoDiffusionPipeline
+    # wrapper objects don't have an .eval() method (verified against
+    # diffusers 0.40.0 source -- only .to() is defined on the pipeline
+    # itself; each submodel is already loaded in eval mode by
+    # from_pretrained). Calling pipe.eval() here raised AttributeError
+    # immediately after loading, on every single video generation request.
+    
+    return {'pipeline': pipe, 'device': device}
 
 
 def _load_clip_model(model_id: str, device: str) -> Dict[str, Any]:

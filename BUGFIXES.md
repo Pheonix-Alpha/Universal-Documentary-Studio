@@ -221,3 +221,70 @@ standard `transformers`/`bitsandbytes` pattern but could only be
 type/logic-checked here, not executed against real weights — worth a real
 smoke test on an actual T4 Colab before you rely on it.
 
+---
+
+## Addendum 2: video-model loading crash + a deeper redundancy behind it
+
+Reported symptom: `ValueError: It seems like you have activated sequential
+model offloading ... attempting to move the pipeline to GPU`, thrown from
+`model_manager._load_video_model`.
+
+**Root cause:** that function called both
+`pipe.enable_sequential_cpu_offload()` *and* `pipe.to(device)` right after.
+`enable_sequential_cpu_offload()` takes over device placement itself
+(streaming submodules to GPU only as each is needed) and explicitly
+forbids a subsequent `.to()` call — diffusers raises exactly that error.
+Fixed by dropping the offload call and keeping only
+`enable_attention_slicing()` + a plain `.to(device)`.
+
+**A second, independent crash in the same function:** `pipe.eval()`.
+Verified directly against the `diffusers` 0.40.0 source —
+`DiffusionPipeline`/`StableVideoDiffusionPipeline` don't define an `.eval()`
+method at all (only `.to()`). That line raised `AttributeError` immediately
+after every load, right after the offload fix would have otherwise let it
+through. Removed.
+
+**The bigger issue this surfaced:** `worker_server.py`'s `/video/generate`
+handler calls `model_manager.auto_download_and_load_model(model_id)` to
+load the pipeline into VRAM (Step 2) — but the code that actually generates
+frames, `video_models.generate_video()` → `_generate_img2vid`/
+`_generate_text2vid`, **completely ignored that loaded pipeline** and did
+its own separate `StableVideoDiffusionPipeline.from_pretrained(...)` from
+disk, from scratch, **on every single scene**. So the crash above was
+happening on a load whose result was then thrown away — and even once
+fixed, every scene in a documentary would independently reload the entire
+multi-GB model off disk (tens of seconds to minutes each, for a 9.5GB
+model), instead of loading it once per worker session.
+
+Fixed by making `video_models.generate_video()` fetch the pipeline via
+`model_manager.auto_download_and_load_model()` (a cheap cache-hit after the
+first call) and passing it down into `_generate_img2vid`/`_generate_text2vid`
+as a parameter, instead of each of those reloading it independently. This
+also removed a hardcoded `model_path = 'cerspense/zeroscope_v2_576w'`
+override in `_generate_text2vid` that bypassed the locally downloaded copy
+entirely and would have tried to re-fetch ZeroScope straight from the Hub
+on every call.
+
+**A third bug found while testing this refactor:** inside
+`_generate_img2vid`, `import base64` was written *only* inside the
+`if reference_image:` branch — but `base64` is already imported at module
+level. Because Python treats a name as local to the whole function the
+moment it's assigned/imported anywhere in that function, this shadowed the
+module-level import: whenever `reference_image` was falsy (the common
+case — most scenes don't have one), `base64` was unbound by the time
+`base64.b64encode(video_bytes)` ran a few lines later, raising
+`UnboundLocalError`. That exception was swallowed by `generate_video()`'s
+broad `try/except`, so **every real SVD generation without a reference
+image was silently falling back to the placeholder gradient video** — with
+no visible error, just quietly never using the real model. Fixed by
+removing the redundant local import.
+
+**Verified** with a mock `diffusers` pipeline standing in for the real one
+(reproducing the exact offload-then-`.to()` failure the report showed,
+confirming the fix avoids it) and a 3-scene simulated worker run showing
+`from_pretrained()` is now called exactly once across all 3 scenes instead
+of 3 times, with real (non-fallback) video output on every scene. Like the
+LLM changes above, the actual GPU/diffusers execution itself couldn't be
+run in this sandbox (no GPU, no real model weights) — worth confirming on
+an actual worker Colab.
+
