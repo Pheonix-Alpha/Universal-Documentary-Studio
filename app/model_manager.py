@@ -7,6 +7,7 @@ import shutil
 import json
 import threading
 import time
+import queue
 from typing import Dict, List, Optional, Any, Generator
 from dataclasses import dataclass, asdict
 import hashlib
@@ -545,44 +546,232 @@ def generate_text(
     max_new_tokens: int = 2048,
     temperature: float = 0.4,
     model_id: str = LOCAL_BRAIN_MODEL_ID,
+    progress_callback=None,
 ) -> str:
-    """The single entry point every "brain" task (scene analysis, bible
-    generation, script enhancement, search-query generation) calls instead
-    of hitting the Anthropic API. Auto-downloads/loads the local LLM (via
-    the same auto_download_and_load_model() path video/CLIP models use, so
-    it gets the same VRAM-aware loading, caching, and storage cleanup) and
-    runs a single chat completion."""
-    loaded = auto_download_and_load_model(model_id)
+    """
+    Generate text using the local LLM.
+
+    If progress_callback is supplied, live generation information is
+    reported while the model is generating.
+    """
+
+    loaded = auto_download_and_load_model(
+        model_id,
+        progress_callback=progress_callback
+    )
+
     model = loaded['model']
     tokenizer = loaded['tokenizer']
     device = loaded['device']
 
     messages = []
+
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": user_prompt})
+        messages.append({
+            "role": "system",
+            "content": system_prompt
+        })
+
+    messages.append({
+        "role": "user",
+        "content": user_prompt
+    })
 
     prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
     )
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device if device == 'cuda' else device)
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0,
-            temperature=max(temperature, 0.01),
-            top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    inputs = tokenizer(
+        prompt_text,
+        return_tensors="pt"
+    ).to(
+        model.device if device == 'cuda' else device
+    )
+
+    # ---------------------------------------------------------
+    # No callback = keep the original simple generation path
+    # ---------------------------------------------------------
+    if progress_callback is None:
+
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=max(temperature, 0.01),
+                top_p=0.9,
+                pad_token_id=(
+                    tokenizer.pad_token_id
+                    or tokenizer.eos_token_id
+                ),
+            )
+
+        new_tokens = output_ids[0][
+            inputs['input_ids'].shape[1]:
+        ]
+
+        text = tokenizer.decode(
+            new_tokens,
+            skip_special_tokens=True
         )
 
-    new_tokens = output_ids[0][inputs['input_ids'].shape[1]:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        _update_last_used(model_id)
+
+        return text.strip()
+
+    # ---------------------------------------------------------
+    # LIVE GENERATION MODE
+    # ---------------------------------------------------------
+
+    from transformers import TextIteratorStreamer
+
+    streamer = TextIteratorStreamer(
+        tokenizer,
+        skip_prompt=True,
+        skip_special_tokens=True
+    )
+
+    generation_kwargs = {
+        **inputs,
+        "streamer": streamer,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": temperature > 0,
+        "temperature": max(temperature, 0.01),
+        "top_p": 0.9,
+        "pad_token_id": (
+            tokenizer.pad_token_id
+            or tokenizer.eos_token_id
+        ),
+    }
+
+    # Generation must happen in another thread.
+    # Otherwise iterating the streamer would block.
+    generation_error = []
+
+    def _generate():
+        try:
+            with torch.no_grad():
+                model.generate(**generation_kwargs)
+        except Exception as exc:
+            generation_error.append(exc)
+
+    generation_thread = threading.Thread(
+        target=_generate,
+        daemon=True
+    )
+
+    generation_thread.start()
+
+    generated_text_parts = []
+
+    generated_tokens = 0
+    start_time = time.time()
+    last_update_time = start_time
+
+    progress_callback(
+        {
+            "type": "llm_start",
+            "model": model_id,
+            "max_tokens": max_new_tokens,
+        }
+    )
+
+    try:
+
+        for text_chunk in streamer:
+
+            generated_text_parts.append(text_chunk)
+
+            # Estimate tokens represented by this streamed chunk.
+            chunk_tokens = len(
+                tokenizer.encode(
+                    text_chunk,
+                    add_special_tokens=False
+                )
+            )
+
+            if chunk_tokens <= 0:
+                chunk_tokens = 1
+
+            generated_tokens += chunk_tokens
+
+            now = time.time()
+            elapsed = now - start_time
+
+            # Don't update thousands of times per second.
+            # Update roughly every 0.5 seconds.
+            if (
+                now - last_update_time >= 0.5
+                or generated_tokens == 1
+            ):
+
+                percentage = min(
+                    99,
+                    int(
+                        generated_tokens
+                        / max_new_tokens
+                        * 100
+                    )
+                )
+
+                tokens_per_second = (
+                    generated_tokens / elapsed
+                    if elapsed > 0
+                    else 0
+                )
+
+                remaining_tokens = max(
+                    0,
+                    max_new_tokens - generated_tokens
+                )
+
+                eta_seconds = (
+                    remaining_tokens / tokens_per_second
+                    if tokens_per_second > 0
+                    else 0
+                )
+
+                progress_callback(
+                    {
+                        "type": "llm_progress",
+                        "model": model_id,
+                        "generated_tokens": generated_tokens,
+                        "max_tokens": max_new_tokens,
+                        "percentage": percentage,
+                        "tokens_per_second": tokens_per_second,
+                        "elapsed": elapsed,
+                        "eta_seconds": eta_seconds,
+                    }
+                )
+
+                last_update_time = now
+
+    finally:
+        generation_thread.join()
+
+    if generation_error:
+        raise generation_error[0]
+
+    text = "".join(generated_text_parts).strip()
+
+    elapsed = time.time() - start_time
+
+    progress_callback(
+        {
+            "type": "llm_complete",
+            "model": model_id,
+            "generated_tokens": generated_tokens,
+            "max_tokens": max_new_tokens,
+            "percentage": 100,
+            "elapsed": elapsed,
+        }
+    )
 
     _update_last_used(model_id)
-    return text.strip()
 
+    return text
 
 def _unload_unused_models(keep: List[str] = None):
     """Unload models from VRAM to free memory"""

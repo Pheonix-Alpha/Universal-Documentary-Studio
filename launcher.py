@@ -7,20 +7,35 @@ Run this in your primary Colab notebook.
 import subprocess
 import sys
 import os
-
+from app import cache_manager
 
 def install_requirements():
     """Install required packages"""
     print("📦 Installing requirements...")
     try:
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", "-r", "requirements.txt"
-        ])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
+        )
         print("✅ Requirements installed.")
         return True
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to install requirements: {e}")
         return False
+
+
+def mount_google_drive():
+    try:
+        from google.colab import drive
+
+        drive.mount("/content/drive", force_remount=False)
+
+        print("✅ Google Drive mounted")
+
+    except ImportError:
+        print("ℹ️ Not running inside Google Colab. " "Drive cache disabled.")
+
+    except Exception as e:
+        print(f"⚠️ Google Drive mount failed: {e}")
 
 
 def launch_app():
@@ -29,10 +44,10 @@ def launch_app():
     repo_root = os.path.dirname(os.path.abspath(__file__))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    
+
     from app.gradio_app import build_app
     import gradio as gr
-    
+
     print("🚀 Launching Universal Documentary Studio...")
     demo = build_app()
     # gr.Blocks.launch() has no `theme` kwarg -- the theme is set once, at
@@ -49,10 +64,11 @@ def main():
     ║   Powered by AI Video Generation         ║
     ╚═══════════════════════════════════════════╝
     """)
-    
+
     if not install_requirements():
         sys.exit(1)
-    
+    mount_google_drive()
+    cache_manager.initialize_cache()
     launch_app()
 
 

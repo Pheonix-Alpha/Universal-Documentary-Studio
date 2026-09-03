@@ -36,7 +36,7 @@ def _strip_code_fence(text: str) -> str:
     return text.strip()
 
 
-def _analyze_with_local_brain(story: str):
+def _analyze_with_local_brain(story: str, progress_callback=None):
     """Uses the local LLM running on the main Colab's own GPU (see
     model_manager.generate_text) instead of the Anthropic API -- no key,
     no external call."""
@@ -54,13 +54,23 @@ def _analyze_with_local_brain(story: str):
         system_prompt="You are a scene-breakdown assistant. Output only valid JSON.",
         max_new_tokens=2000,
         temperature=0.2,
+        progress_callback=progress_callback,
     )
     return json.loads(_strip_code_fence(text))
 
 
-def analyze_story(story: str):
+def analyze_story(story: str, progress_callback=None):
+
     try:
-        return _analyze_with_local_brain(story)
-    except Exception as e:  # noqa: BLE001
-        print(f"[scene_analyzer] Local brain analysis failed, falling back to rule-based split: {e}")
+        return _analyze_with_local_brain(
+            story,
+            progress_callback=progress_callback
+        )
+
+    except Exception as e:
+        print(
+            f"[scene_analyzer] Local brain analysis failed, "
+            f"falling back to rule-based split: {e}"
+        )
+
     return _fallback_scene_split(story)

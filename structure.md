@@ -1,499 +1,435 @@
-Updated Project Structure & Execution Flow
-This document maps every file and function in the enhanced codebase, tracing the order things actually run in. The system has evolved from a storyboard/image retrieval system into a full-featured distributed video generation studio with intelligent resource management.
+# Project Structure & Execution Flow (Updated)
 
-🎯 Architecture Overview
-text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         MAIN COLAB ("The Director")                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  📖 PRODUCTION BIBLE SYSTEM                                                 │
-│  ├── Scene Analyzer      → Breaks story into scenes                        │
-│  ├── Bible Generator     → Creates character/location/style bibles        │
-│  └── Script Enhancer     → Improves dialogue and narrative                │
-│                                                                             │
-│  🎬 SCENE ORCHESTRATOR                                                     │
-│  ├── Unit Breakdown      → Converts bible to production units             │
-│  ├── Consistency Manager → Ensures cross-worker consistency               │
-│  └── Task Distributor    → Assigns scenes to workers                      │
-│                                                                             │
-│  🧠 SMART MODEL MANAGER                                                    │
-│  ├── Storage Management  → Auto-cleanup when disk is full                 │
-│  ├── VRAM Management     → Auto-unload models to free memory              │
-│  └── Smart Download      → Checks space before downloading                │
-│                                                                             │
-│  🌐 WORKER COORDINATOR                                                     │
-│  ├── Worker Registry     → Tracks all connected workers                   │
-│  ├── Load Balancer       → Round-robin distribution                       │
-│  └── Health Monitoring   → Checks worker status                           │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      WORKER COLABS ("Render Nodes")                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  🎥 VIDEO GENERATION ENGINE                                                │
-│  ├── Model Loader        → Loads models with VRAM management              │
-│  ├── Video Generator     → Generates clips from prompts                   │
-│  └── Format Converter    → Converts frames to video                       │
-│                                                                             │
-│  🧠 SMART MODEL MANAGER (Worker side)                                      │
-│  ├── Local Storage       → Manages model cache                            │
-│  ├── VRAM Management     → Smart model swapping                           │
-│  └── Auto-Cleanup        → Deletes unused models                          │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-📁 Complete File Structure
-text
+> This replaces the previous `structure.md`, which described a planned/older
+> version of the system (Claude-API-powered bible generation, a separate
+> "outputs/" tree, a 5-tab Gradio UI, etc.). The sections below were
+> regenerated directly from the current `main` branch source (commit
+> `b88b307`), function-by-function, so every file/class/function name here
+> actually exists in the repo today.
+
+## 🎯 What this repo actually is right now
+
+This is **not yet** the multi-agent "Universal Documentary Studio" described
+in the README's aspirational sections. The current codebase is a
+**story → scene breakdown → production bible → distributed video-clip
+generation** pipeline, wrapped in a single Gradio app, with an optional
+FastAPI "worker" process that does the actual GPU-heavy generation. There is
+no `adapters/`, `agents/`, `core/`, `engines/`, `qa/`, or `tests/` directory
+in this branch — the entire implementation lives under `app/`, driven by two
+entry points (`launcher.py`, `worker.py`).
+
+Key architectural fact: **there is no Anthropic/Claude API dependency
+anymore.** Story analysis, production-bible generation, and script
+enhancement all run on a local "brain" LLM (`Qwen/Qwen2.5-7B-Instruct`,
+4-bit quantized) loaded on the main Colab's own GPU via
+`model_manager.generate_text()`, with rule-based fallbacks if that model
+isn't available. `config.py` no longer has an Anthropic key at all — only
+image-source API keys (Unsplash, Flickr, Pexels, Pixabay).
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     MAIN COLAB — "the director"                     │
+│  (Gradio app: launcher.py → app/gradio_app.py)                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  📖 Local "brain" LLM (Qwen2.5-7B, 4-bit)                            │
+│     scene_analyzer → production_bible → script_enhancer             │
+│                                                                       │
+│  🎬 scene_orchestrator → ProductionUnit list                        │
+│  🧩 consistency_manager → per-unit worker context (seeds/style)     │
+│  🧠 model_selector → auto-picks a video model for the job/worker    │
+│  🌐 worker_client → sends generation jobs to connected workers      │
+│  🖼️ compute.py / clip_ranker.py → local CLIP fallback ranking       │
+└─────────────────────────────────────────────────────────────────────┘
+                                   │  HTTP (requests)
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  WORKER COLAB(S) — "render nodes"                   │
+│  (worker.py → app/worker_server.py, FastAPI + cloudflared tunnel)   │
+├─────────────────────────────────────────────────────────────────────┤
+│  /health /models /models/{id}/download /models/{id}/progress        │
+│  /models/storage /models/cleanup /rank /video/generate              │
+│     → model_manager.py (download/VRAM mgmt) + video_models.py       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 📁 Complete file structure (actual)
+
+```
 Universal-Documentary-Studio/
-├── launcher.py                  # MAIN entry point (enhanced)
-├── worker.py                    # WORKER entry point (enhanced)
-├── requirements.txt             # Updated with video gen libs
-├── README.md                    # Documentation
+├── launcher.py              # MAIN entry point (installs deps, launches Gradio)
+├── worker.py                # WORKER entry point (FastAPI server + cloudflared tunnel)
+├── requirements.txt
+├── README.md                # Describes the earlier "storyboard" version of the project
+├── BUGFIXES.md              # Log of crash fixes vs. the pre-fix main branch
+├── structure.md             # (this file — regenerated)
 │
-├── app/
-│   ├── __init__.py
-│   │
-│   ├── config.py                # Settings + API keys (live updates)
-│   │
-│   ├── model_manager.py         # ★ COMPLETE REWRITE - Smart model mgmt
-│   │   ├── MODEL_REGISTRY       # All models with sizes/types
-│   │   ├── smart_download_model()  # Auto-cleanup before download
-│   │   ├── load_model_into_vram()  # Auto-unload old models
-│   │   ├── _smart_cleanup()     # Delete least-used models
-│   │   ├── get_available_storage() # Storage status
-│   │   └── get_vram_status()    # VRAM status
-│   │
-│   ├── clip_ranker.py           # KEPT - Local CLIP ranking
-│   │   ├── _load_clip()         # Loads CLIP model
-│   │   ├── _fetch_image()       # Downloads candidate images
-│   │   └── rank_candidates()    # Ranks images by similarity
-│   │
-│   ├── video_models.py          # ★ NEW - Video generation interface
-│   │   ├── VIDEO_MODEL_REGISTRY # Video model definitions
-│   │   ├── generate_video()     # Main video generation
-│   │   ├── generate_with_loaded_model() # Uses pre-loaded model
-│   │   ├── _generate_svd()      # Stable Video Diffusion
-│   │   ├── _generate_diffusion() # Generic diffusion
-│   │   └── _frames_to_video_bytes() # Convert to MP4
-│   │
-│   ├── production_bible.py      # ★ NEW - Bible generation
-│   │   ├── ProductionBible      # Dataclass for bible
-│   │   ├── Character            # Character dataclass
-│   │   ├── Location             # Location dataclass
-│   │   ├── VisualStyle          # Style dataclass
-│   │   ├── generate_production_bible() # Main entry point
-│   │   └── _generate_bible_with_claude() # AI-powered bible
-│   │
-│   ├── script_enhancer.py       # ★ NEW - Script improvement
-│   │   ├── enhance_script()     # Main entry point
-│   │   ├── _enhance_with_claude() # AI enhancement
-│   │   └── _enhance_fallback()  # Rule-based fallback
-│   │
-│   ├── scene_orchestrator.py    # ★ NEW - Scene breakdown
-│   │   ├── ProductionUnit       # Scene production unit
-│   │   ├── SceneOrchestrator    # Orchestrator class
-│   │   ├── breakdown()          # Create production units
-│   │   └── _generate_visual_prompt() # Create video prompt
-│   │
-│   ├── consistency_manager.py   # ★ NEW - Cross-worker consistency
-│   │   ├── ConsistencyManager   # Main class
-│   │   ├── get_worker_context() # Generate context for workers
-│   │   ├── get_consistency_hash() # Hash for caching
-│   │   └── share_character_reference() # Share character data
-│   │
-│   ├── compute.py               # ENHANCED - Dispatcher
-│   │   ├── backend_name()       # "worker" or "local"
-│   │   ├── list_models()        # Lists all models
-│   │   ├── is_installed()       # Checks model installation
-│   │   └── rank_candidates()    # Dispatches to local/worker
-│   │
-│   ├── worker_client.py         # ENHANCED - Worker communication
-│   │   ├── _workers             # Worker registry
-│   │   ├── add_worker()         # Add worker connection
-│   │   ├── list_workers()       # List all workers
-│   │   ├── is_any_connected()   # Check connectivity
-│   │   ├── generate_video_round_robin() # ★ NEW - Distribute video gen
-│   │   ├── _generate_video_on_worker() # Call specific worker
-│   │   └── list_video_models()  # List video models on workers
-│   │
-│   ├── worker_server.py         # ENHANCED - Worker API
-│   │   ├── build_fastapi_app()  # Creates FastAPI app
-│   │   ├── /health              # Health with VRAM/storage status
-│   │   ├── /models              # List models with status
-│   │   ├── /models/{id}/download # Smart download
-│   │   ├── /models/{id}/progress # Download progress
-│   │   ├── /models/storage      # Storage information
-│   │   ├── /models/cleanup      # Manual cleanup trigger
-│   │   ├── /rank                # CLIP ranking
-│   │   └── /video/generate      # ★ NEW - Video generation endpoint
-│   │
-│   ├── scene_analyzer.py        # ENHANCED - Story analysis
-│   │   ├── analyze_story()      # Main entry point
-│   │   ├── _analyze_with_claude() # AI scene analysis
-│   │   └── _fallback_scene_split() # Rule-based split
-│   │
-│   ├── query_generator.py       # KEPT - Search query generation
-│   │   ├── generate_queries()   # Main entry point
-│   │   ├── _generate_with_claude() # AI queries
-│   │   └── _fallback_queries()  # Rule-based queries
-│   │
-│   ├── image_sources.py         # KEPT - Image retrieval
-│   │   ├── gather_candidates()  # Main entry point
-│   │   ├── search_wikimedia()   # Wikimedia API
-│   │   ├── search_nasa()        # NASA API
-│   │   ├── search_flickr()      # Flickr API (keyed)
-│   │   └── ... (many sources)
-│   │
-│   ├── pipeline.py              # ★ COMPLETE REWRITE - Video pipeline
-│   │   └── run_video_pipeline() # The main flow generator
-│   │       ├── Stage 1: Validate story
-│   │       ├── Stage 2: Generate Production Bible
-│   │       ├── Stage 3: Scene Orchestration
-│   │       ├── Stage 4: Generate Reference Images
-│   │       ├── Stage 5: Distribute Video Generation
-│   │       ├── Stage 6: Assemble Final Video
-│   │       └── Stage 7: Complete
-│   │
-│   └── gradio_app.py            # ★ GREATLY ENHANCED - UI
-│       ├── Tab 1: Generate Video
-│       ├── Tab 2: Models & Resources (NEW dashboard)
-│       │   ├── Storage/VRAM dashboard
-│       │   ├── Model list with status
-│       │   ├── Smart download with cleanup
-│       │   └── Delete/Cleanup controls
-│       ├── Tab 3: Workers
-│       ├── Tab 4: API Keys
-│       └── Tab 5: Image Sources (kept)
-│
-└── outputs/
-    ├── bibles/                  # Production bibles (JSON)
-    ├── clips/                   # Generated video clips
-    └── final/                   # Assembled final video
-🔄 Execution Flow
-1. MAIN APP — python launcher.py
-text
+└── app/
+    ├── __init__.py                  # empty
+    ├── config.py                    # Paths (MODEL_DIR/DATA_DIR) + image-source API keys
+    │   ├── KEY_SPECS                # Unsplash / Flickr / Pexels / Pixabay specs
+    │   ├── get_key() / set_key() / is_key_set()
+    │
+    ├── model_manager.py             # Unified model registry + smart download/VRAM mgmt (653 lines)
+    │   ├── ModelInfo                 (dataclass)
+    │   ├── MODEL_REGISTRY            # video (SVD, ZeroScope, Realistic Vision),
+    │   │                             #   CLIP (ViT-B/32, ViT-L/14), and the local
+    │   │                             #   LLM (Qwen2.5-7B-Instruct) in ONE registry
+    │   ├── LOCAL_BRAIN_MODEL_ID      # = 'Qwen/Qwen2.5-7B-Instruct'
+    │   ├── get_model_size() / get_vram_required() / is_installed() / get_model_path()
+    │   ├── get_installed_models() / list_models()
+    │   ├── calculate_total_storage() / get_actual_model_size_gb() / get_available_storage()
+    │   ├── get_vram_status()
+    │   ├── auto_download_and_load_model()
+    │   ├── smart_download_model()    # yields (pct, msg) progress
+    │   ├── _smart_cleanup()          # frees space by evicting least-used models
+    │   ├── _load_model_into_vram() → _load_video_model() / _load_clip_model() / _load_llm_model()
+    │   ├── generate_text()           # runs the local brain LLM for JSON-structured tasks
+    │   ├── _unload_unused_models() / _update_last_used() / _get_last_used()
+    │   └── delete_model()
+    │
+    ├── model_selector.py            # "The brain decides which video model to use" (NEW)
+    │   ├── VIDEO_MODEL_PRIORITY     # SVD > ZeroScope > Realistic Vision
+    │   ├── _worker_health()         # reads worker's /health for VRAM/storage
+    │   ├── select_video_model()     # picks best model for job + worker resources
+    │   └── describe_selection()
+    │
+    ├── clip_ranker.py               # Local CLIP text↔image similarity ranking
+    │   ├── _load_clip() / _fetch_image() / _extract_embedding()
+    │   └── rank_candidates()
+    │
+    ├── compute.py                   # Dispatch: local CLIP vs. worker CLIP
+    │   ├── backend_name() / list_models() / is_installed()
+    │   └── rank_candidates()        # routes to clip_ranker or worker_client
+    │
+    ├── video_models.py              # Video generation interface (396 lines)
+    │   ├── list_video_models() / is_video_model_installed()
+    │   ├── generate_video()         # main entry (img2vid or text2vid based on model)
+    │   ├── _generate_img2vid() / _generate_text2vid()
+    │   ├── generate_fallback()      # public wrapper (added per BUGFIXES.md #4)
+    │   ├── _generate_fallback_video() # placeholder-image based fallback, no GPU needed
+    │   ├── _get_model_path() / _create_placeholder_image()
+    │   └── _frames_to_video_bytes()
+    │
+    ├── scene_analyzer.py            # Story → scenes
+    │   ├── _fallback_scene_split()  # rule-based sentence splitter
+    │   ├── _strip_code_fence()
+    │   ├── _analyze_with_local_brain()   # uses model_manager.generate_text()
+    │   └── analyze_story()          # entry point, tries local brain then falls back
+    │
+    ├── query_generator.py           # Scene → search queries (for reference images)
+    │   ├── _fallback_queries() / _generate_with_local_brain()
+    │   └── generate_queries()
+    │
+    ├── image_sources.py             # Multi-source reference-image retrieval (445 lines)
+    │   ├── _candidate()
+    │   ├── search_wikimedia() / search_nasa() / search_internet_archive()
+    │   ├── search_met_museum() / search_openverse() / search_loc()
+    │   ├── search_flickr() / search_pexels() / search_pixabay()
+    │   ├── _get_ddgs_class() / search_duckduckgo()
+    │   └── gather_candidates()      # fans out across all sources
+    │
+    ├── production_bible.py          # Character/location/style bible generation (321 lines)
+    │   ├── _scene_people()          # accepts scene['people'] as list OR comma-string
+    │   ├── Character / Location / VisualStyle / ProductionBible  (dataclasses)
+    │   ├── ProductionBible.to_dict()
+    │   ├── generate_production_bible()      # entry point
+    │   ├── _generate_bible_with_local_brain()  # uses model_manager.generate_text()
+    │   ├── _generate_bible_fallback()       # rule-based
+    │   └── _enrich_scenes_with_bible()
+    │
+    ├── script_enhancer.py           # Dialogue/narrative improvement
+    │   ├── enhance_script()         # entry point
+    │   ├── _enhance_with_local_brain()
+    │   └── _enhance_fallback()
+    │
+    ├── scene_orchestrator.py        # Bible → per-scene production units
+    │   ├── ProductionUnit           (dataclass) + to_dict()
+    │   └── SceneOrchestrator
+    │       ├── breakdown() / _create_unit() / _generate_visual_prompt()
+    │       ├── get_pending_units() / get_assigned_units()
+    │       ├── update_unit_status() / get_unit_by_id()
+    │
+    ├── consistency_manager.py       # Cross-worker visual/character consistency
+    │   └── ConsistencyManager
+    │       ├── get_worker_context()          # seeds, style, character/location data
+    │       ├── get_consistency_hash()
+    │       ├── share_character_reference()
+    │       └── get_shared_character_reference()
+    │
+    ├── worker_client.py             # Main Colab's HTTP client to worker(s) (337 lines)
+    │   ├── add_worker() / remove_worker() / check_worker() / list_workers()
+    │   ├── is_any_connected() / connected_worker_ids() / get_worker()
+    │   ├── generate_video_on_worker()
+    │   ├── generate_video_round_robin()
+    │   ├── list_video_models_on_worker() / list_models()
+    │   ├── rank_candidates_on_worker() / rank_candidates_round_robin()   # added, see BUGFIXES.md #3
+    │   └── switch_video_model()     # deletes other resident video model, installs the chosen one
+    │
+    ├── worker_server.py             # FastAPI app run on the worker (392 lines)
+    │   ├── RankRequest / VideoGenRequest / VideoGenResponse   (Pydantic models)
+    │   ├── build_fastapi_app()
+    │   │   ├── GET  /health                 # VRAM/storage status
+    │   │   ├── GET  /models                 # list with install status
+    │   │   ├── POST /models/{id}/download   # smart download w/ progress
+    │   │   ├── GET  /models/{id}/progress
+    │   │   ├── GET  /models/storage
+    │   │   ├── POST /models/cleanup
+    │   │   ├── POST /rank                   # CLIP ranking
+    │   │   └── POST /video/generate
+    │   └── _generate_with_model()
+    │
+    ├── pipeline.py                  # Orchestrates the whole flow, yields UI progress (263 lines)
+    │   └── run_video_pipeline(story, model_id="auto", duration_per_scene, auto_download,
+    │                           fps, width, height, quality_preference)
+    │       ├── Stage 1: Validate story (≥ 20 chars)
+    │       ├── Stage 2: Check for connected workers
+    │       ├── Stage 2b: Ensure local brain LLM is downloaded/loaded
+    │       ├── Stage 3: production_bible.generate_production_bible() + script_enhancer.enhance_script()
+    │       │            (re-runs scene analysis if the enhanced script actually changed)
+    │       ├── Stage 4: scene_orchestrator.breakdown() → ProductionUnits
+    │       ├── Stage 4b: model_selector.select_video_model() ("auto" by default)
+    │       │            → worker_client.switch_video_model() if a worker is connected
+    │       ├── Stage 5: per-scene generation loop
+    │       │            → worker_client.generate_video_on_worker() (with consistency context)
+    │       │            → or video_models.generate_fallback() if no worker is connected
+    │       └── Stage 6: yield finished clips + first clip as "final_video"
+    │
+    └── gradio_app.py                # UI (420 lines)
+        ├── _b64_video_to_tempfile()
+        └── build_app()
+            ├── Tab 1: "🎬 Generate"   — story box, video-model dropdown (auto/manual),
+            │                            duration slider, progress/log, gallery + final video,
+            │                            collapsible "Model Status (Auto)" JSON panel
+            ├── Tab 2: "⚙️ Workers"    — add/remove/list connected GPU workers
+            └── Tab 3: "🔑 API Keys"   — set the image-source keys from config.KEY_SPECS
+        └── launch_app()
+```
+
+> Note: the older `structure.md` listed an `outputs/{bibles,clips,final}`
+> directory and a 5-tab UI including a dedicated "Models & Resources"
+> dashboard tab and an "Image Sources" tab. Neither exists in the current
+> `gradio_app.py` (3 tabs only) or on disk (no `outputs/` directory is
+> created by any current code path — generated clip bytes are kept
+> in-memory/base64 and streamed straight to the Gradio gallery/video
+> components).
+
+## 🔄 Execution flow
+
+### 1. Main app — `python launcher.py`
+
+```
 launcher.py
-    │
-    ├── install_requirements()       # Pip install requirements
-    │
-    └── launch_app()
-        │
-        └── gradio_app.build_app()   # Builds the UI
-            │
-            └── demo.launch()        # Starts Gradio server
-2. GENERATE VIDEO FLOW — Click "Generate Video"
-text
-User clicks "🎬 Generate Video"
-    │
-    ▼
-pipeline.run_video_pipeline(story, clip_model, video_model, top_k, duration)
-    │
-    ├── Stage 1: Validate
-    │   └── Check story length > 10 chars
-    │
-    ├── Stage 2: Generate Production Bible
-    │   ├── production_bible.generate_production_bible(story)
-    │   │   ├── scene_analyzer.analyze_story(story)    # Get scenes
-    │   │   ├── _generate_bible_with_claude(story)     # AI bible (if key set)
-    │   │   │   ├── Extract characters → Character objects
-    │   │   │   ├── Extract locations → Location objects
-    │   │   │   └── Extract visual style → VisualStyle
-    │   │   └── _enrich_scenes_with_bible(scenes, bible)  # Add context
-    │   │
-    │   └── script_enhancer.enhance_script(story, bible)
-    │       └── _enhance_with_claude(story, bible)     # AI script enhancement
-    │
-    ├── Stage 3: Scene Orchestration
-    │   ├── SceneOrchestrator(bible)
-    │   ├── orchestrator.breakdown()
-    │   │   └── For each scene → ProductionUnit
-    │   │       ├── scene_id, description
-    │   │       ├── characters, location
-    │   │       ├── visual_prompt (generated)
-    │   │       ├── seed (bible.global_seed + scene_id)
-    │   │       └── style_context
-    │   │
-    │   └── consistency_manager.ConsistencyManager(bible)
-    │
-    ├── Stage 4: Generate Reference Images (placeholder)
-    │   └── TODO: Generate character reference images for consistency
-    │
-    ├── Stage 5: Distribute Video Generation
-    │   ├── Check: worker_client.is_any_connected() OR video_models.is_installed()
-    │   │
-    │   └── For each ProductionUnit in production_units:
-    │       │
-    │       ├── Get consistency context
-    │       │   └── consistency_manager.get_worker_context(unit)
-    │       │
-    │       ├── IF workers available:
-    │       │   └── worker_client.generate_video_round_robin(
-    │       │           prompt=unit.visual_prompt,
-    │       │           model_id=video_model_id,
-    │       │           context=context,
-    │       │           duration=duration_per_scene,
-    │       │           seed=unit.seed
-    │       │       )
-    │       │       │
-    │       │       ├── connected_worker_ids()   # Get connected workers
-    │       │       ├── Pick next worker (round-robin)
-    │       │       └── _generate_video_on_worker(worker_id, ...)
-    │       │           └── POST {worker_url}/video/generate
-    │       │
-    │       └── ELSE (local generation):
-    │           └── video_models.generate_video(
-    │                   prompt=unit.visual_prompt,
-    │                   model_id=video_model_id,
-    │                   context=context,
-    │                   ...
-    │               )
-    │               │
-    │               └── model_manager.load_model_into_vram(model_id)
-    │                   ├── _unload_unused_models()   # Free VRAM
-    │                   └── _load_video_model()       # Load into VRAM
-    │
-    ├── Stage 6: Assemble Final Video
-    │   └── _assemble_video(generated_clips)    # Placeholder
-    │
-    └── Stage 7: Complete
-        └── Yield final results to UI
-3. SMART MODEL DOWNLOAD FLOW
-text
-User clicks "Download Model" in UI
+    ├── install_requirements()     # pip install -r requirements.txt
+    ├── launch_app()
+    │   └── gradio_app.build_app() → demo.launch(share=True)
+    └── main()                     # CLI entry point
+```
+
+### 2. Worker — `python worker.py`
+
+```
+worker.py
+    ├── install_requirements()
+    ├── download_cloudflared()     # fetches the cloudflared binary
+    ├── start_server()             # runs worker_server's FastAPI app (in a thread)
+    ├── start_tunnel(port=8000)    # opens a cloudflared quick tunnel, prints the public URL
+    └── main()
+```
+
+The printed `https://xxxx.trycloudflare.com` URL is pasted into the main
+app's "⚙️ Workers" tab via `worker_client.add_worker()`.
+
+### 3. Generate-video flow — clicking "🎬 Generate Video"
+
+```
+gradio_app.build_app()  (Tab 1 callback)
     │
     ▼
-model_manager.smart_download_model(model_id)
+pipeline.run_video_pipeline(story, model_id, duration_per_scene, ...)
     │
-    ├── Check if already installed
-    │   └── If yes → Return "already installed"
+    ├── validate story
+    ├── worker_client.is_any_connected()
+    ├── model_manager.smart_download_model(LOCAL_BRAIN_MODEL_ID)   # first run only
     │
-    ├── Calculate available storage
-    │   └── calculate_total_storage_used()
+    ├── production_bible.generate_production_bible(story)
+    │   ├── scene_analyzer.analyze_story(story)
+    │   │   └── _analyze_with_local_brain()  → model_manager.generate_text()
+    │   ├── _generate_bible_with_local_brain() / _generate_bible_fallback()
+    │   └── _enrich_scenes_with_bible()
     │
-    ├── Check if enough space for model
-    │   ├── IF not enough space:
-    │   │   └── _smart_cleanup(needed_gb)
-    │   │       ├── Get all installed models with last_used
-    │   │       ├── Sort by: never used → oldest → largest
-    │   │       ├── Delete models until enough space freed
-    │   │       └── Return amount freed
-    │   │
-    │   └── IF still not enough → Error
+    ├── script_enhancer.enhance_script(story, bible)
+    │   └── (re-analyzes scenes if the script actually changed)
     │
-    ├── Download model
-    │   └── huggingface_hub.snapshot_download(...)
+    ├── scene_orchestrator.SceneOrchestrator(bible).breakdown()
+    │   └── _generate_visual_prompt() per scene → ProductionUnit list
     │
-    └── _update_model_last_used(model_id)   # Track usage
-4. WORKER VIDEO GENERATION FLOW
-text
-Worker receives POST /video/generate
+    ├── consistency_manager.ConsistencyManager(bible)
     │
-    ▼
-worker_server.generate_video(request)
+    ├── model_selector.select_video_model(units, worker_id, quality_preference)
+    │   └── reads worker /health, picks from VIDEO_MODEL_PRIORITY
+    ├── worker_client.switch_video_model(worker_id, chosen_model_id)
     │
-    ├── model_manager.load_model_into_vram(model_id)
-    │   ├── _unload_unused_models(keep=[model_id])   # Free VRAM
-    │   └── _load_video_model(model_id, device)
-    │       └── DiffusionPipeline.from_pretrained(...)
-    │           ├── torch_dtype=torch.float16
-    │           ├── low_cpu_mem_usage=True
-    │           └── Enable attention slicing for memory efficiency
-    │
-    ├── video_models.generate_with_loaded_model(
-    │       loaded_model,
-    │       prompt,
-    │       context,
-    │       duration_seconds,
-    │       fps,
-    │       width,
-    │       height,
-    │       seed,
-    │       reference_image
-    │   )
-    │   │
-    │   ├── Check VRAM before generation
-    │   │   └── If >90% used → torch.cuda.empty_cache()
-    │   │
-    │   ├── Generate based on model type:
-    │   │   ├── Stable Video Diffusion → _generate_svd()
-    │   │   └── Other diffusion models → _generate_diffusion()
-    │   │
-    │   └── Convert frames to video
-    │       └── _frames_to_video_bytes(frames, fps)
-    │
-    └── Return base64-encoded video
-🗺️ File Dependency Map
-text
+    └── for each ProductionUnit:
+            worker_client.generate_video_on_worker(
+                worker_id, prompt=unit.visual_prompt, model_id=chosen_model_id,
+                context=consistency.get_worker_context(unit),
+                duration_seconds, fps, width, height, seed=unit.seed
+            )
+            # OR, if no worker connected:
+            video_models.generate_fallback(prompt, duration, fps, width, height, seed)
+```
+
+### 4. Worker-side video generation — `POST /video/generate`
+
+```
+worker_server.build_fastapi_app()  → /video/generate
+    └── _generate_with_model(model_id, prompt, duration, fps, width, height, seed)
+        ├── model_manager.auto_download_and_load_model(model_id)  # download if needed
+        │   └── smart_download_model() → _smart_cleanup() if storage is tight
+        ├── model_manager._load_model_into_vram() → _load_video_model()
+        │   └── _unload_unused_models() first if VRAM is tight
+        └── video_models.generate_video(loaded_model, prompt, ...)
+            ├── _generate_img2vid()  or  _generate_text2vid()   (by model type)
+            └── _frames_to_video_bytes(frames, fps)             # → base64 MP4 bytes
+```
+
+## 🗺️ File dependency map
+
+```
 launcher.py
-    └── gradio_app.py
-        ├── pipeline.py
-        │   ├── production_bible.py
-        │   │   ├── scene_analyzer.py
-        │   │   ├── script_enhancer.py
-        │   │   └── config.py (for API keys)
-        │   │
-        │   ├── scene_orchestrator.py
-        │   │   └── production_bible.py
-        │   │
-        │   ├── consistency_manager.py
-        │   │   └── production_bible.py
-        │   │
-        │   ├── worker_client.py
-        │   │   └── compute.py
-        │   │
-        │   ├── video_models.py
-        │   │   └── model_manager.py
-        │   │
-        │   └── compute.py
-        │       ├── model_manager.py
-        │       ├── clip_ranker.py
-        │       └── worker_client.py
-        │
-        ├── model_manager.py
-        │   ├── config.py
-        │   └── huggingface_hub
-        │
-        └── video_models.py
-            └── model_manager.py
+    └── app/gradio_app.py
+        ├── app/pipeline.py
+        │   ├── app/production_bible.py
+        │   │   ├── app/scene_analyzer.py
+        │   │   ├── app/script_enhancer.py
+        │   │   └── app/model_manager.py   (generate_text — local brain)
+        │   ├── app/scene_orchestrator.py  → app/production_bible.py
+        │   ├── app/consistency_manager.py → app/production_bible.py
+        │   ├── app/model_selector.py      → app/model_manager.py, app/worker_client.py
+        │   ├── app/worker_client.py       → app/compute.py
+        │   ├── app/video_models.py        → app/model_manager.py
+        │   └── app/model_manager.py
+        └── (Workers tab) → app/worker_client.py
+            (API Keys tab) → app/config.py
 
 worker.py
-    └── worker_server.py
-        ├── model_manager.py
-        ├── video_models.py
-        ├── clip_ranker.py
-        └── config.py
-🔧 Key Data Structures
-ProductionUnit
-python
+    └── app/worker_server.py
+        ├── app/model_manager.py
+        ├── app/video_models.py
+        ├── app/clip_ranker.py
+        └── app/config.py
+
+app/compute.py
+    ├── app/clip_ranker.py     (local CLIP path)
+    └── app/worker_client.py   (remote CLIP path)
+
+app/image_sources.py           # used by an earlier storyboard flow (query_generator +
+app/query_generator.py         # image_sources); not currently called from pipeline.py,
+                                # kept for the reference-image retrieval feature described
+                                # in README.md
+```
+
+## 🔧 Key data structures
+
+**`ProductionUnit`** (`scene_orchestrator.py`)
+```python
 {
     'scene_id': int,
     'description': str,
     'characters': List[str],
     'location': str,
-    'visual_prompt': str,      # Full prompt for video generation
+    'visual_prompt': str,
     'duration_seconds': int,
     'seed': int,
-    'style_context': Dict,     # From bible
-    'assigned_worker': str,
-    'status': str              # pending, generating, completed, failed
+    'style_context': Dict,
+    'assigned_worker': Optional[str],
+    'status': str,               # pending | generating | completed | failed
 }
-Model Registry Entry
-python
+```
+
+**`MODEL_REGISTRY` entry** (`model_manager.py`)
+```python
 {
-    'id': str,
     'name': str,
-    'type': str,               # 'clip', 'video', 'text'
+    'type': str,          # 'video' | 'clip' | 'llm'
     'size_gb': float,
     'description': str,
-    'installed': bool,
-    'path': str,
-    'last_used': float,
-    'priority': int
+    'vram_gb': float,
 }
-Worker Context (for consistency)
-python
+```
+
+**Worker context** (`consistency_manager.get_worker_context()`)
+```python
 {
     'global_seed': int,
     'scene_seed': int,
-    'style': {
-        'visual_style': str,
-        'color_palette': List[str],
-        'cinematography': str,
-        'lighting': str,
-        'camera': str,
-        'film_grain': bool
-    },
-    'characters': {
-        'name': {
-            'appearance': str,
-            'personality': List[str],
-            'voice': str,
-            'reference_prompt': str
-        }
-    },
-    'locations': {
-        'name': {
-            'description': str,
-            'atmosphere': str,
-            'key_elements': List[str],
-            'time_of_day': str,
-            'weather': str
-        }
-    }
+    'style': {...},        # from ProductionBible.VisualStyle
+    'characters': {name: {...}},
+    'locations': {name: {...}},
 }
-🎯 Where to Make Common Changes
-I want to...	Edit this
-Add a new CLIP/video model	model_manager.py → MODEL_REGISTRY
-Change model size calculation	model_manager.py → get_actual_model_size()
-Change storage limit	model_manager.py → MAX_STORAGE_GB
-Change cleanup strategy	model_manager.py → _smart_cleanup()
-Add a new video generation model	video_models.py → VIDEO_MODEL_REGISTRY + new _generate_*() function
-Change video generation logic	video_models.py → generate_with_loaded_model()
-Change how the bible is generated	production_bible.py → generate_production_bible()
-Change how scenes are split	scene_analyzer.py → analyze_story()
-Change script enhancement	script_enhancer.py → enhance_script()
-Change consistency enforcement	consistency_manager.py → get_worker_context()
-Change worker load balancing	worker_client.py → generate_video_round_robin()
-Add a new worker capability	worker_server.py → /health + new endpoint
-Change the UI layout	gradio_app.py → build_app()
-Change the full pipeline flow	pipeline.py → run_video_pipeline()
-Add a new API key	config.py → KEY_SPECS
-🚀 Deployment Commands
-Main Colab:
-bash
-# Clone the repo
-git clone https://github.com/yourusername/Universal-Documentary-Studio.git
-cd Universal-Documentary-Studio
+```
 
-# Run the launcher
+## 🎯 Where to make common changes
+
+| I want to...                                  | Edit this |
+|------------------------------------------------|-----------|
+| Add/remove a video, CLIP, or LLM model          | `model_manager.py → MODEL_REGISTRY` |
+| Change the local-brain model                    | `model_manager.py → LOCAL_BRAIN_MODEL_ID` |
+| Change storage/VRAM limits or cleanup strategy  | `model_manager.py → MAX_STORAGE_GB`, `_smart_cleanup()` |
+| Change auto model-selection logic               | `model_selector.py → VIDEO_MODEL_PRIORITY`, `select_video_model()` |
+| Change how scenes are split                     | `scene_analyzer.py → analyze_story()` |
+| Change bible generation                         | `production_bible.py → generate_production_bible()` |
+| Change script enhancement                       | `script_enhancer.py → enhance_script()` |
+| Change per-scene visual prompts                 | `scene_orchestrator.py → _generate_visual_prompt()` |
+| Change cross-scene consistency rules            | `consistency_manager.py → get_worker_context()` |
+| Change worker load balancing                    | `worker_client.py → generate_video_round_robin()` |
+| Add a worker API endpoint                       | `worker_server.py → build_fastapi_app()` |
+| Change the pipeline flow/stages                 | `pipeline.py → run_video_pipeline()` |
+| Add a new image source                          | `image_sources.py` (add a `search_*()` + wire into `gather_candidates()`) |
+| Add a new image-source API key                  | `config.py → KEY_SPECS` |
+| Change the UI                                   | `gradio_app.py → build_app()` |
+
+## 🚀 Deployment commands
+
+**Main Colab:**
+```bash
+git clone <YOUR_REPO_URL> Universal-Documentary-Studio
+cd Universal-Documentary-Studio
 python launcher.py
-Wait for the Gradio URL (e.g., https://xxxx.gradio.live)
+# wait for the printed Gradio URL (https://xxxx.gradio.live)
+```
 
-Worker Colab (one or more):
-bash
-# Clone the repo
-git clone https://github.com/yourusername/Universal-Documentary-Studio.git
+**Worker Colab (one or more):**
+```bash
+git clone <YOUR_REPO_URL> Universal-Documentary-Studio
 cd Universal-Documentary-Studio
-
-# Run the worker
 python worker.py
-Wait for the Cloudflare URL (e.g., https://xxxx.trycloudflare.com)
-Copy this URL → Paste into Main app's "Workers" tab
+# wait for the printed cloudflared URL (https://xxxx.trycloudflare.com)
+# paste it into the main app's "⚙️ Workers" tab
+```
 
-📊 Monitoring Resources
-In the UI:
-Models & Resources tab shows:
+## 📊 Monitoring resources
 
-💾 Storage usage (used/max GB)
+Via the worker's own API:
+```bash
+curl http://<worker-url>/health           # VRAM + storage status
+curl http://<worker-url>/models           # installed models + status
+curl http://<worker-url>/models/storage   # storage breakdown
+```
 
-⚡ VRAM usage (used/total GB)
+## ⚠️ Known gaps vs. the README's stated goal
 
-📦 Installed models with sizes
-
-🔄 Download progress with status
-
-Via API (worker):
-bash
-# Health check
-curl http://worker-url:8000/health
-
-# Storage status
-curl http://worker-url:8000/models/storage
-
-# List models
-curl http://worker-url:8000/models
-🔮 Future Enhancements
-Feature	Description
-Character Consistency	Generate reference images for characters using SD
-Video Assembly	Proper video stitching with transitions
-Audio Generation	Add narration and sound effects
-Parallel Worker Jobs	Multiple scenes per worker concurrently
-Weighted Load Balancing	Distribute based on worker capabilities
-Model Quantization	Use 8-bit/4-bit models to save VRAM
-Inference Caching	Cache generated clips for reuse
-Progressive Refinement	Generate low-res first, then upscale
-This structure represents a complete production-ready system that can generate videos from stories using distributed GPU workers, with intelligent resource management to handle Colab's limitations!
-
+- `README.md` still describes this as a "story → verified image storyboard"
+  prototype, and the top-level narration in some prior planning docs
+  describes a much larger "Universal Documentary Studio" (per-day
+  documentaries, Shorts, thumbnails, human-review dashboard, `ARCHITECTURE.md`,
+  `MODELS.md`, `LICENSES.md`, etc.). None of that scaffolding
+  (`adapters/`, `agents/`, `core/`, `engines/`, `qa/`, `tests/`,
+  `ARCHITECTURE.md`, `MODELS.md`, `LICENSES.md`, `SETUP_COLAB.md`,
+  `TROUBLESHOOTING.md`) exists in the current `main` branch — this file
+  documents what is actually implemented today, not that longer-term plan.
+- `image_sources.py` / `query_generator.py` (multi-source reference-image
+  retrieval + CLIP ranking) are fully implemented but not currently wired
+  into `pipeline.run_video_pipeline()` — they're reachable via
+  `compute.py`/`clip_ranker.py` but the video pipeline doesn't call them.
+- There is no automated test suite (`pytest`, `tests/`) in this branch.
