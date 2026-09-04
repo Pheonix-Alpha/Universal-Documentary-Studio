@@ -363,35 +363,78 @@ def _create_placeholder_image(prompt: str, width: int, height: int) -> Image.Ima
 
 
 def _frames_to_video_bytes(frames: List[np.ndarray], fps: int) -> bytes:
-    """Convert frames to video bytes"""
+    """Convert PIL/NumPy frames to MP4 video bytes."""
     if not frames:
         return b''
-    
+
     try:
         import cv2
-        
-        height, width = frames[0].shape[:2]
-        
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+
+        # Normalize all frames to NumPy arrays
+        normalized_frames = []
+
+        for frame in frames:
+
+            # Stable Video Diffusion returns PIL Images
+            if isinstance(frame, Image.Image):
+                frame = np.array(frame.convert("RGB"))
+
+            # Other models may already return NumPy arrays
+            else:
+                frame = np.asarray(frame)
+
+            normalized_frames.append(frame)
+
+        # Get dimensions from normalized frame
+        height, width = normalized_frames[0].shape[:2]
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.mp4',
+            delete=False
+        ) as tmp:
+
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(tmp.name, fourcc, fps, (width, height))
-            
-            for frame in frames:
-                if isinstance(frame, np.ndarray):
-                    if len(frame.shape) == 2:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                    elif frame.shape[2] == 4:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-                    out.write(frame)
-            
+
+            out = cv2.VideoWriter(
+                tmp.name,
+                fourcc,
+                fps,
+                (width, height)
+            )
+
+            for frame in normalized_frames:
+
+                if len(frame.shape) == 2:
+                    frame = cv2.cvtColor(
+                        frame,
+                        cv2.COLOR_GRAY2BGR
+                    )
+
+                elif frame.shape[2] == 4:
+                    frame = cv2.cvtColor(
+                        frame,
+                        cv2.COLOR_RGBA2BGR
+                    )
+
+                else:
+                    # PIL → NumPy gives RGB,
+                    # OpenCV VideoWriter expects BGR
+                    frame = cv2.cvtColor(
+                        frame,
+                        cv2.COLOR_RGB2BGR
+                    )
+
+                out.write(frame)
+
             out.release()
-            
+
             with open(tmp.name, 'rb') as f:
                 video_bytes = f.read()
-            
+
             os.unlink(tmp.name)
+
             return video_bytes
-            
+
     except Exception as e:
         print(f"❌ Failed to convert frames to video: {e}")
         return b''

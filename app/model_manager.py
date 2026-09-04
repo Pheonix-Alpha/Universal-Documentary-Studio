@@ -130,10 +130,8 @@ def is_installed(model_id: str) -> bool:
 def get_model_path(model_id: str) -> str:
     """Get local model path"""
     safe_id = model_id.replace('/', '__')
-    model_dir = os.path.join(config.MODEL_DIR, 'models')
-    os.makedirs(model_dir, exist_ok=True)
-    return os.path.join(model_dir, safe_id)
-
+    os.makedirs(config.MODEL_DIR, exist_ok=True)
+    return os.path.join(config.MODEL_DIR, safe_id)
 
 def get_installed_models() -> List[str]:
     """Get list of installed model IDs"""
