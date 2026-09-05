@@ -162,6 +162,13 @@ def start_main_tunnel(port=8000):
                 print("=" * 60)
                 print(f"🌐 MAIN API URL: {main_api_url}")
                 print("=" * 60)
+                from app import runtime_manager
+                from app import main_endpoint_manager
+                runtime_info = runtime_manager.get_runtime_info()
+                main_endpoint_manager.write_main_endpoint(
+                    url=tunnel_url,
+                    runtime_id=runtime_info["runtime_id"],
+                )
                 print()
 
                 break
