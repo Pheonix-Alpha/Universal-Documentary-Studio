@@ -380,7 +380,21 @@ def run_video_pipeline(
 
     # ---- Stage 5: Generate Videos on Workers ----
     generated_clips = []
+
+    if total_scenes == 0:
+      yield {
+        "stage": "error",
+        "pct": 30,
+        "log": "❌ No production scenes were created.",
+        "gallery": [],
+        "video": None,
+        "model_status": model_status,
+    }
+      return
+
+
     for idx, unit in enumerate(production_units):
+
         pct = 30 + (idx / total_scenes) * 65
 
         # ========================================================

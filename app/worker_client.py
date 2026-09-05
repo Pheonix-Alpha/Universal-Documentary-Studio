@@ -20,33 +20,33 @@ def add_worker(url: str, label: str = None) -> str:
     """Add a worker to the registry"""
     # Normalize URL
     url = url.strip()
-    if not url.startswith(('http://', 'https://')):
-        url = f'https://{url}'
-    url = url.rstrip('/')
-    
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    url = url.rstrip("/")
+
     # Check if already exists
     for worker_id, w in _workers.items():
-        if w['url'] == url:
+        if w["url"] == url:
             return worker_id
-    
+
     # Create new worker entry
     worker_id = f"worker_{int(time.time())}"
     _workers[worker_id] = {
-        'id': worker_id,
-        'url': url,
-        'label': label or url,
-        'added_at': time.time(),
-        'last_health_check': 0,
-        'connected': False,
-        'status': 'unknown',
-        'device': 'unknown',
-        'capabilities': {},
-        'load': 0
+        "id": worker_id,
+        "url": url,
+        "label": label or url,
+        "added_at": time.time(),
+        "last_health_check": 0,
+        "connected": False,
+        "status": "unknown",
+        "device": "unknown",
+        "capabilities": {},
+        "load": 0,
     }
-    
+
     # Initial health check
     check_worker(worker_id)
-    
+
     return worker_id
 
 
@@ -63,22 +63,22 @@ def check_worker(worker_id: str) -> tuple:
     worker = _workers.get(worker_id)
     if not worker:
         return False, "Worker not found"
-    
+
     try:
         response = requests.get(f"{worker['url']}/health", timeout=5)
         if response.status_code == 200:
             data = response.json()
-            worker['connected'] = True
-            worker['status'] = data.get('status', 'ok')
-            worker['device'] = data.get('device', 'unknown')
-            worker['capabilities'] = data.get('capabilities', {})
-            worker['last_health_check'] = time.time()
+            worker["connected"] = True
+            worker["status"] = data.get("status", "ok")
+            worker["device"] = data.get("device", "unknown")
+            worker["capabilities"] = data.get("capabilities", {})
+            worker["last_health_check"] = time.time()
             return True, "Connected"
     except Exception as e:
         print(f"Worker health check failed: {e}")
-    
-    worker['connected'] = False
-    worker['status'] = 'disconnected'
+
+    worker["connected"] = False
+    worker["status"] = "disconnected"
     return False, "Disconnected"
 
 
@@ -87,16 +87,18 @@ def list_workers() -> List[Dict[str, Any]]:
     workers = []
     for worker_id, worker in _workers.items():
         connected, status = check_worker(worker_id)
-        workers.append({
-            'id': worker_id,
-            'url': worker['url'],
-            'label': worker['label'],
-            'connected': connected,
-            'status': status,
-            'device': worker.get('device', 'unknown'),
-            'capabilities': worker.get('capabilities', {}),
-            'load': worker.get('load', 0)
-        })
+        workers.append(
+            {
+                "id": worker_id,
+                "url": worker["url"],
+                "label": worker["label"],
+                "connected": connected,
+                "status": status,
+                "device": worker.get("device", "unknown"),
+                "capabilities": worker.get("capabilities", {}),
+                "load": worker.get("load", 0),
+            }
+        )
     return workers
 
 
@@ -125,7 +127,6 @@ def get_worker(worker_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ---- Video Generation Functions ----
-
 def generate_video_on_worker(
     worker_id: str,
     prompt: str,
@@ -137,48 +138,169 @@ def generate_video_on_worker(
     height: int = 320,
     seed: int = 42,
     reference_image: Optional[str] = None,
-    timeout: int = 300
+    timeout: int = 1800,
 ) -> Dict[str, Any]:
-    """Call a worker to generate video"""
+    """
+    Generate video asynchronously on a worker.
+
+    The worker immediately returns a job_id.
+    This function then polls the worker until the video is ready.
+
+    timeout is the TOTAL maximum time allowed for the job.
+    Default: 30 minutes.
+    """
+
     worker = _workers.get(worker_id)
+
     if not worker:
         raise ValueError(f"Worker {worker_id} not found")
-    
-    if not worker.get('connected', False):
+
+    if not worker.get("connected", False):
         raise RuntimeError(f"Worker {worker_id} is not connected")
-    
-    # Increment load
-    worker['load'] = worker.get('load', 0) + 1
-    
+
+    worker["load"] = worker.get("load", 0) + 1
+
     try:
+
         payload = {
-            'prompt': prompt,
-            'model_id': model_id,
-            'context': context or {},
-            'duration_seconds': duration_seconds,
-            'fps': fps,
-            'width': width,
-            'height': height,
-            'seed': seed,
-            'reference_image': reference_image
+            "prompt": prompt,
+            "model_id": model_id,
+            "context": context or {},
+            "duration_seconds": duration_seconds,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "seed": seed,
+            "reference_image": reference_image,
         }
-        
+
+        # ========================================================
+        # STEP 1: SUBMIT JOB
+        # ========================================================
+
+        print("")
+        print("🖥️ Submitting video job to worker...")
+
         response = requests.post(
             f"{worker['url']}/video/generate",
             json=payload,
-            timeout=timeout
+            timeout=30,
         )
+
         response.raise_for_status()
-        
-        result = response.json()
-        
-        if 'video_data' not in result:
-            raise RuntimeError("Worker returned invalid response")
-        
+
+        job_info = response.json()
+
+        job_id = job_info.get("job_id")
+
+        if not job_id:
+            raise RuntimeError(f"Worker did not return job_id: {job_info}")
+
+        print(f"✅ Worker accepted job: {job_id}")
+
+        # ========================================================
+        # STEP 2: POLL STATUS
+        # ========================================================
+
+        started = time.time()
+        last_status = None
+        last_progress = None
+
+        poll_interval = 5
+
+        while True:
+
+            elapsed = time.time() - started
+
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"Worker video job timed out after " f"{timeout} seconds: {job_id}"
+                )
+
+            try:
+
+                status_response = requests.get(
+                    f"{worker['url']}/video/status/{job_id}",
+                    timeout=15,
+                )
+
+                status_response.raise_for_status()
+
+                status = status_response.json()
+
+            except requests.RequestException as poll_error:
+
+                # A temporary tunnel hiccup should NOT immediately
+                # destroy the long-running video job.
+                print(f"⚠️ Status poll failed: {poll_error}")
+                print("   Retrying...")
+
+                time.sleep(poll_interval)
+                continue
+
+            current_status = status.get("status", "unknown")
+
+            progress = status.get("progress", 0)
+
+            message = status.get("message", "")
+
+            if current_status != last_status or progress != last_progress:
+
+                print(f"🖥️ Worker job {job_id}: " f"{current_status} " f"{progress}%")
+
+                if message:
+                    print(f"   └─ {message}")
+
+                last_status = current_status
+                last_progress = progress
+
+            # ====================================================
+            # FAILED
+            # ====================================================
+
+            if current_status == "failed":
+
+                error = status.get("error", "Unknown worker error")
+
+                raise RuntimeError(f"Worker video job failed: {error}")
+
+            # ====================================================
+            # COMPLETED
+            # ====================================================
+
+            if current_status == "completed":
+
+                print(f"✅ Worker completed job {job_id}")
+
+                break
+
+            time.sleep(poll_interval)
+
+        # ========================================================
+        # STEP 3: DOWNLOAD RESULT
+        # ========================================================
+
+        print(f"📥 Retrieving video result: {job_id}")
+
+        result_response = requests.get(
+            f"{worker['url']}/video/result/{job_id}",
+            timeout=60,
+        )
+
+        result_response.raise_for_status()
+
+        result = result_response.json()
+
+        if not result.get("video_data"):
+            raise RuntimeError("Worker completed the job but returned " "no video_data")
+
+        print(f"✅ Video received from worker: " f"{len(result['video_data'])} bytes")
+
         return result
-        
+
     finally:
-        worker['load'] = max(0, worker.get('load', 0) - 1)
+
+        worker["load"] = max(0, worker.get("load", 0) - 1)
 
 
 def generate_video_round_robin(
@@ -191,35 +313,42 @@ def generate_video_round_robin(
     height: int = 320,
     seed: int = 42,
     reference_image: Optional[str] = None,
-    max_retries: int = 3
+    max_retries: int = 3,
 ) -> Dict[str, Any]:
     """Generate video using workers in round-robin fashion"""
     connected = connected_worker_ids()
     if not connected:
         raise RuntimeError("No connected workers available")
-    
+
     # Try each worker
     for attempt in range(max_retries):
         # Pick next worker
         worker_id = connected[next(_rr_counter) % len(connected)]
-        
+
         try:
             return generate_video_on_worker(
-                worker_id, prompt, model_id, context,
-                duration_seconds, fps, width, height,
-                seed, reference_image
+                worker_id,
+                prompt,
+                model_id,
+                context,
+                duration_seconds,
+                fps,
+                width,
+                height,
+                seed,
+                reference_image,
             )
         except Exception as e:
             print(f"Worker {worker_id} failed: {e}")
             # Remove from connected and try next
             if worker_id in connected:
                 connected.remove(worker_id)
-            
+
             if not connected:
                 break
-            
+
             continue
-    
+
     raise RuntimeError("All workers failed to generate video")
 
 
@@ -228,12 +357,12 @@ def list_video_models_on_worker(worker_id: str) -> List[Dict[str, Any]]:
     worker = _workers.get(worker_id)
     if not worker:
         return []
-    
+
     try:
         response = requests.get(f"{worker['url']}/models", timeout=5)
         if response.status_code == 200:
             data = response.json()
-            return data.get('video_models', [])
+            return data.get("video_models", [])
     except Exception:
         pass
     return []
@@ -253,7 +382,7 @@ def list_models(worker_id: str) -> List[Dict[str, Any]]:
         response = requests.get(f"{worker['url']}/models", timeout=10)
         response.raise_for_status()
         data = response.json()
-        return data.get('models', [])
+        return data.get("models", [])
     except Exception as e:
         print(f"[worker_client] list_models failed for {worker_id}: {e}")
         return []
@@ -274,7 +403,12 @@ def rank_candidates_on_worker(
 
     response = requests.post(
         f"{worker['url']}/rank",
-        json={"text": text, "candidates": candidates, "model_id": model_id, "top_k": top_k},
+        json={
+            "text": text,
+            "candidates": candidates,
+            "model_id": model_id,
+            "top_k": top_k,
+        },
         timeout=timeout,
     )
     response.raise_for_status()
@@ -299,7 +433,9 @@ def rank_candidates_round_robin(
     for attempt in range(max_retries):
         worker_id = connected[next(_rr_counter) % len(connected)]
         try:
-            return rank_candidates_on_worker(worker_id, text, candidates, model_id, top_k)
+            return rank_candidates_on_worker(
+                worker_id, text, candidates, model_id, top_k
+            )
         except Exception as e:
             print(f"Worker {worker_id} failed to rank: {e}")
             if worker_id in connected:
@@ -326,13 +462,23 @@ def switch_video_model(worker_id: str, new_model_id: str) -> None:
     try:
         models = list_models(worker_id)
     except Exception as e:
-        print(f"[worker_client] switch_video_model: could not list models on {worker_id}: {e}")
+        print(
+            f"[worker_client] switch_video_model: could not list models on {worker_id}: {e}"
+        )
         return
 
     for m in models:
-        if m.get('type') == 'video' and m.get('installed') and m.get('id') != new_model_id:
+        if (
+            m.get("type") == "video"
+            and m.get("installed")
+            and m.get("id") != new_model_id
+        ):
             try:
-                print(f"🧹 Deleting {m['id']} on {worker_id} to make room for {new_model_id}")
+                print(
+                    f"🧹 Deleting {m['id']} on {worker_id} to make room for {new_model_id}"
+                )
                 requests.delete(f"{worker['url']}/models/{m['id']}", timeout=60)
             except Exception as e:
-                print(f"[worker_client] switch_video_model: failed to delete {m['id']} on {worker_id}: {e}")
+                print(
+                    f"[worker_client] switch_video_model: failed to delete {m['id']} on {worker_id}: {e}"
+                )
