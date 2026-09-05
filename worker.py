@@ -12,7 +12,7 @@ import time
 import threading
 import urllib.request
 import stat
-
+from app import runtime_manager
 
 def install_requirements():
     """Install required packages"""
@@ -173,6 +173,17 @@ def main():
     
     if not install_requirements():
         sys.exit(1)
+        # ---------------------------------------------------------
+    # Startup runtime check
+    # ---------------------------------------------------------
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    from app import runtime_manager
+
+    runtime_manager.print_runtime_report(role="worker")
     
     port = start_server()
     

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import os
 from app import cache_manager
+from app import runtime_manager
 
 def install_requirements():
     """Install required packages"""
@@ -24,20 +25,35 @@ def install_requirements():
 
 
 def mount_google_drive():
+    """Mount Google Drive when running inside Google Colab."""
+
     try:
         from google.colab import drive
 
-        drive.mount("/content/drive", force_remount=False)
+        drive_path = "/content/drive"
 
-        print("✅ Google Drive mounted")
+        # Already mounted
+        if os.path.exists(os.path.join(drive_path, "MyDrive")):
+            print("✅ Google Drive already mounted")
+            return True
+
+        print("📁 Google Drive is not mounted.")
+        print("ℹ️ Please run this in a separate Colab cell:")
+        print()
+        print('   from google.colab import drive')
+        print('   drive.mount("/content/drive")')
+        print()
+
+        return False
 
     except ImportError:
-        print("ℹ️ Not running inside Google Colab. " "Drive cache disabled.")
+        print("ℹ️ Not running inside Google Colab. Drive cache disabled.")
+        return False
 
     except Exception as e:
-        print(f"⚠️ Google Drive mount failed: {e}")
-
-
+        print(f"⚠️ Google Drive check failed: {e}")
+        return False
+    
 def launch_app():
     """Launch the main application"""
     # Add app directory to path
@@ -69,6 +85,7 @@ def main():
         sys.exit(1)
     mount_google_drive()
     cache_manager.initialize_cache()
+    runtime_manager.print_runtime_report(role="main")
     launch_app()
 
 
