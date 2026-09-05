@@ -26,9 +26,8 @@ from app import model_manager, worker_client
 # Best -> worst quality. Must match the video-type entries in
 # model_manager.MODEL_REGISTRY.
 VIDEO_MODEL_PRIORITY = [
-    "stabilityai/stable-video-diffusion-img2vid",  # best quality, heaviest
-    "cerspense/zeroscope_v2_576w",                 # balanced
-    "SG161222/Realistic_Vision_V5.1_noVAE",        # lightest, fastest
+    "stabilityai/stable-video-diffusion-img2vid",
+    "cerspense/zeroscope_v2_576w",
 ]
 
 
