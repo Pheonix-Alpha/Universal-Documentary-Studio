@@ -152,6 +152,40 @@ def start_tunnel(port=8000):
     except Exception as e:
         print(f"❌ Tunnel error: {e}")
 
+def check_main_api(url):
+    """
+    Check whether the Main API is reachable.
+    """
+
+    if not url:
+        return False
+
+    try:
+        import requests
+
+        url = url.rstrip("/") + "/health"
+
+        response = requests.get(
+            url,
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+
+            if data.get("status") == "ok":
+                print(f"✅ Main API is reachable: {url}")
+                return True
+
+        print(
+            f"⚠️ Main API check failed: "
+            f"HTTP {response.status_code}"
+        )
+
+    except Exception as e:
+        print(f"⚠️ Main API is unreachable: {e}")
+
+    return False
 
 def main():
     print("""

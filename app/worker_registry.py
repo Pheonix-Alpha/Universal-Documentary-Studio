@@ -52,35 +52,27 @@ def register_worker(worker_info: Dict[str, Any]) -> bool:
 # ============================================================
 # UPDATE
 # ============================================================
-
 def update_worker(
     runtime_id: str,
     updates: Dict[str, Any],
+    update_last_seen: bool = True,
 ) -> bool:
-    """
-    Update information about an existing worker.
-    """
 
     with _registry_lock:
-
         if runtime_id not in _workers:
             return False
 
         _workers[runtime_id].update(updates)
-        _workers[runtime_id]["last_seen"] = time.time()
+
+        if update_last_seen:
+            _workers[runtime_id]["last_seen"] = time.time()
 
     return True
-
-
 # ============================================================
 # HEARTBEAT
 # ============================================================
 
 def heartbeat(runtime_id: str) -> bool:
-    """
-    Mark a worker as alive.
-    """
-
     return update_worker(
         runtime_id,
         {"status": "online"},

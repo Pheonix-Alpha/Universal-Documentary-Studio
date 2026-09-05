@@ -10,7 +10,7 @@ import os
 from app import cache_manager
 from app import runtime_manager
 from app import capability_manager
-
+from app import worker_monitor
 
 def install_requirements():
     """Install required packages"""
@@ -210,6 +210,7 @@ def main():
     runtime_manager.print_runtime_report(role="main")
     capability_manager.print_capability_report()
     launch_main_api()
+    worker_monitor.start_worker_monitor()
 
 
     main_api_url, main_tunnel_process = start_main_tunnel(port=8000)
