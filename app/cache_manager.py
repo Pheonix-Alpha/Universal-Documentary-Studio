@@ -29,19 +29,35 @@ BIBLES_DIR = os.path.join(CACHE_ROOT, "production_bibles")
 
 SCENES_DIR = os.path.join(CACHE_ROOT, "scenes")
 
+# ============================================================
+# DRIVE AVAILABILITY
+# ============================================================
+
+def is_drive_available() -> bool:
+    """
+    Check whether Google Drive is actually mounted.
+
+    /content/drive may exist even when Drive is not mounted,
+    so we specifically check for MyDrive.
+    """
+    return os.path.isdir("/content/drive/MyDrive")
+
 
 # ============================================================
 # INITIALIZE
 # ============================================================
 
-
 def initialize_cache() -> bool:
     """
     Create the Drive cache directory structure.
+
+    Returns False when Google Drive is unavailable.
+    This is not considered a fatal application error.
     """
 
-    if not os.path.exists("/content/drive"):
-        print("⚠️ Google Drive is not mounted.")
+    if not is_drive_available():
+        print("ℹ️ Google Drive is not mounted.")
+        print("   Persistent Drive cache disabled.")
         return False
 
     try:
@@ -57,8 +73,6 @@ def initialize_cache() -> bool:
     except Exception as e:
         print(f"⚠️ Cache initialization failed: {e}")
         return False
-
-
 # ============================================================
 # STORY HASH
 # ============================================================
@@ -208,12 +222,14 @@ def load_brain_result(story: str) -> Optional[Dict[str, Any]]:
 
 def get_scene_directory(story: str) -> str:
 
+    if not is_drive_available():
+        raise RuntimeError("Google Drive is not mounted.")
+
     directory = os.path.join(SCENES_DIR, get_story_hash(story))
 
     os.makedirs(directory, exist_ok=True)
 
     return directory
-
 
 def get_scene_path(story: str, scene_id: str) -> str:
 
