@@ -361,80 +361,240 @@ def _create_placeholder_image(prompt: str, width: int, height: int) -> Image.Ima
     
     return img
 
-
 def _frames_to_video_bytes(frames: List[np.ndarray], fps: int) -> bytes:
-    """Convert PIL/NumPy frames to MP4 video bytes."""
+    """Convert PIL/NumPy frames to a browser-compatible H.264 MP4."""
+
     if not frames:
         return b''
 
+    temp_dir = None
+    video_path = None
+
     try:
         import cv2
+        import tempfile
+        import subprocess
+        import shutil
 
-        # Normalize all frames to NumPy arrays
+        # --------------------------------------------------
+        # Normalize frames to PIL RGB images
+        # --------------------------------------------------
+
         normalized_frames = []
 
         for frame in frames:
 
-            # Stable Video Diffusion returns PIL Images
             if isinstance(frame, Image.Image):
-                frame = np.array(frame.convert("RGB"))
 
-            # Other models may already return NumPy arrays
+                frame = frame.convert("RGB")
+
             else:
+
                 frame = np.asarray(frame)
+
+                if frame.dtype != np.uint8:
+                    frame = np.clip(
+                        frame,
+                        0,
+                        255
+                    ).astype(np.uint8)
+
+                if len(frame.shape) == 2:
+
+                    frame = Image.fromarray(
+                        frame,
+                        mode="L"
+                    ).convert("RGB")
+
+                elif frame.shape[2] == 4:
+
+                    frame = Image.fromarray(
+                        frame,
+                        mode="RGBA"
+                    ).convert("RGB")
+
+                else:
+
+                    frame = Image.fromarray(
+                        frame
+                    ).convert("RGB")
 
             normalized_frames.append(frame)
 
-        # Get dimensions from normalized frame
-        height, width = normalized_frames[0].shape[:2]
+        if not normalized_frames:
+            return b''
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.mp4',
-            delete=False
-        ) as tmp:
+        # --------------------------------------------------
+        # Create temporary frame directory
+        # --------------------------------------------------
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        temp_dir = tempfile.mkdtemp(
+            prefix="video_frames_"
+        )
 
-            out = cv2.VideoWriter(
-                tmp.name,
-                fourcc,
-                fps,
-                (width, height)
+        print(
+            f"🎞️ Preparing {len(normalized_frames)} frames..."
+        )
+
+        # --------------------------------------------------
+        # Save frames as PNG
+        # --------------------------------------------------
+
+        for i, frame in enumerate(normalized_frames):
+
+            frame_path = os.path.join(
+                temp_dir,
+                f"frame_{i:04d}.png"
             )
 
-            for frame in normalized_frames:
+            frame.save(
+                frame_path,
+                format="PNG"
+            )
 
-                if len(frame.shape) == 2:
-                    frame = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_GRAY2BGR
-                    )
+        # --------------------------------------------------
+        # Create temporary MP4
+        # --------------------------------------------------
 
-                elif frame.shape[2] == 4:
-                    frame = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_RGBA2BGR
-                    )
+        video_file = tempfile.NamedTemporaryFile(
+            suffix=".mp4",
+            delete=False
+        )
 
-                else:
-                    # PIL → NumPy gives RGB,
-                    # OpenCV VideoWriter expects BGR
-                    frame = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_RGB2BGR
-                    )
+        video_path = video_file.name
+        video_file.close()
 
-                out.write(frame)
+        # --------------------------------------------------
+        # FFmpeg → H.264 + yuv420p
+        #
+        # This is browser/Colab compatible.
+        # --------------------------------------------------
 
-            out.release()
+        ffmpeg_command = [
+            "ffmpeg",
+            "-y",
 
-            with open(tmp.name, 'rb') as f:
-                video_bytes = f.read()
+            "-framerate",
+            str(fps),
 
-            os.unlink(tmp.name)
+            "-i",
+            os.path.join(
+                temp_dir,
+                "frame_%04d.png"
+            ),
 
-            return video_bytes
+            "-c:v",
+            "libx264",
+
+            "-pix_fmt",
+            "yuv420p",
+
+            "-movflags",
+            "+faststart",
+
+            "-preset",
+            "fast",
+
+            "-crf",
+            "23",
+
+            video_path
+        ]
+
+        print("🎬 Encoding H.264 MP4...")
+
+        process = subprocess.run(
+            ffmpeg_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if process.returncode != 0:
+
+            print(
+                "❌ FFmpeg encoding failed:"
+            )
+
+            print(
+                process.stderr[-3000:]
+            )
+
+            return b''
+
+        # --------------------------------------------------
+        # Read MP4 bytes
+        # --------------------------------------------------
+
+        if not os.path.exists(video_path):
+
+            print(
+                "❌ FFmpeg did not create video file"
+            )
+
+            return b''
+
+        video_size = os.path.getsize(
+            video_path
+        )
+
+        if video_size == 0:
+
+            print(
+                "❌ Generated MP4 is empty"
+            )
+
+            return b''
+
+        with open(
+            video_path,
+            "rb"
+        ) as f:
+
+            video_bytes = f.read()
+
+        print(
+            f"✅ H.264 MP4 created: "
+            f"{len(video_bytes) / 1024:.1f} KB"
+        )
+
+        return video_bytes
 
     except Exception as e:
-        print(f"❌ Failed to convert frames to video: {e}")
+
+        print(
+            f"❌ Failed to convert frames "
+            f"to video: {e}"
+        )
+
+        traceback.print_exc()
+
         return b''
+
+    finally:
+
+        # --------------------------------------------------
+        # Cleanup temporary files
+        # --------------------------------------------------
+
+        try:
+
+            if temp_dir and os.path.exists(
+                temp_dir
+            ):
+
+                shutil.rmtree(
+                    temp_dir,
+                    ignore_errors=True
+                )
+
+            if video_path and os.path.exists(
+                video_path
+            ):
+
+                os.unlink(
+                    video_path
+                )
+
+        except Exception:
+            pass
