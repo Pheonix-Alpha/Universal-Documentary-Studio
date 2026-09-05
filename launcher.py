@@ -166,7 +166,7 @@ def start_main_tunnel(port=8000):
                 from app import main_endpoint_manager
                 runtime_info = runtime_manager.get_runtime_info()
                 main_endpoint_manager.write_main_endpoint(
-                    url=tunnel_url,
+                    url=main_api_url,
                     runtime_id=runtime_info["runtime_id"],
                 )
                 print()
@@ -212,13 +212,13 @@ def main():
     launch_main_api()
 
 
-main_api_url, main_tunnel_process = start_main_tunnel(port=8000)
+    main_api_url, main_tunnel_process = start_main_tunnel(port=8000)
 
-if not main_api_url:
-    print("❌ Failed to create Main API tunnel.")
-    sys.exit(1)
+    if not main_api_url:
+     print("❌ Failed to create Main API tunnel.")
+     sys.exit(1)
 
-launch_app()
+    launch_app()
 
 
 if __name__ == "__main__":
