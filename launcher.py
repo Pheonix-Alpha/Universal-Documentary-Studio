@@ -11,6 +11,7 @@ from app import cache_manager
 from app import runtime_manager
 from app import capability_manager
 
+
 def install_requirements():
     """Install required packages"""
     print("📦 Installing requirements...")
@@ -41,7 +42,7 @@ def mount_google_drive():
         print("📁 Google Drive is not mounted.")
         print("ℹ️ Please run this in a separate Colab cell:")
         print()
-        print('   from google.colab import drive')
+        print("   from google.colab import drive")
         print('   drive.mount("/content/drive")')
         print()
 
@@ -54,7 +55,34 @@ def mount_google_drive():
     except Exception as e:
         print(f"⚠️ Google Drive check failed: {e}")
         return False
-    
+
+
+def launch_main_api():
+    """Start the Main FastAPI server in a background thread."""
+    import threading
+    import uvicorn
+
+    from app.main_server import build_main_app
+
+    app = build_main_app()
+
+    def run_server():
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=8000,
+            log_level="info",
+        )
+
+    thread = threading.Thread(
+        target=run_server,
+        daemon=True,
+    )
+    thread.start()
+
+    print("🌐 Main API started on port 8000")
+
+
 def launch_app():
     """Launch the main application"""
     # Add app directory to path
@@ -88,6 +116,7 @@ def main():
     cache_manager.initialize_cache()
     runtime_manager.print_runtime_report(role="main")
     capability_manager.print_capability_report()
+    launch_main_api()
     launch_app()
 
 

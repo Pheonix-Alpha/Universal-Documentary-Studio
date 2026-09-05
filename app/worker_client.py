@@ -10,18 +10,21 @@ import base64
 from io import BytesIO
 from PIL import Image
 import itertools
+from app import worker_registry
 
 # Worker registry
 _workers = {}
 _rr_counter = itertools.count()
 
-
 def add_worker(url: str, label: str = None) -> str:
-    """Add a worker to the registry"""
+    """Add a worker and register its runtime information."""
+
     # Normalize URL
     url = url.strip()
+
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
+
     url = url.rstrip("/")
 
     # Check if already exists
@@ -29,8 +32,9 @@ def add_worker(url: str, label: str = None) -> str:
         if w["url"] == url:
             return worker_id
 
-    # Create new worker entry
+    # Create temporary local worker entry
     worker_id = f"worker_{int(time.time())}"
+
     _workers[worker_id] = {
         "id": worker_id,
         "url": url,
@@ -45,10 +49,23 @@ def add_worker(url: str, label: str = None) -> str:
     }
 
     # Initial health check
-    check_worker(worker_id)
+    connected, _ = check_worker(worker_id)
+
+    if connected:
+        worker = _workers[worker_id]
+
+        # Register the worker in the Main registry
+        worker_registry.register_worker({
+            "runtime_id": worker["runtime_id"],
+            "platform": worker.get("platform", "unknown"),
+            "gpu_count": worker.get("gpu_count", 0),
+            "gpus": worker.get("gpus", []),
+            "capabilities": worker.get("capabilities", {}),
+            "endpoint": worker["url"],
+            "label": worker["label"],
+        })
 
     return worker_id
-
 
 def remove_worker(worker_id: str) -> bool:
     """Remove a worker from the registry"""
@@ -68,6 +85,10 @@ def check_worker(worker_id: str) -> tuple:
         response = requests.get(f"{worker['url']}/health", timeout=5)
         if response.status_code == 200:
             data = response.json()
+            worker["runtime_id"] = data.get("runtime_id")
+            worker["platform"] = data.get("platform", "unknown")
+            worker["gpu_count"] = data.get("gpu_count", 0)
+            worker["gpus"] = data.get("gpus", [])
             worker["connected"] = True
             worker["status"] = data.get("status", "ok")
             worker["device"] = data.get("device", "unknown")

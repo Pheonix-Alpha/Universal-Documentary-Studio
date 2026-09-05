@@ -13,7 +13,7 @@ import time
 import traceback
 import torch
 import os
-
+from app import runtime_manager
 from app import model_manager, video_models, clip_ranker
 
 # Store active download jobs
@@ -88,28 +88,51 @@ def build_fastapi_app():
         try:
             import torch
 
+            runtime_info = runtime_manager.get_runtime_info()
+
             return {
-                "status": "ok",
-                "device": "cuda" if torch.cuda.is_available() else "cpu",
-                "vram": (
-                    model_manager.get_vram_status()
-                    if hasattr(model_manager, "get_vram_status")
-                    else {}
-                ),
-                "storage": (
-                    model_manager.get_available_storage()
-                    if hasattr(model_manager, "get_available_storage")
-                    else {}
-                ),
-                "installed_models": (
-                    model_manager.get_installed_models()
-                    if hasattr(model_manager, "get_installed_models")
-                    else []
-                ),
-                "capabilities": {"clip_ranking": True, "video_generation": True},
-            }
+            "status": "ok",
+
+            # Worker identity
+            "runtime_id": runtime_info["runtime_id"],
+            "platform": runtime_info["platform"],
+
+            # Runtime hardware
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "gpu_count": runtime_info["gpu_count"],
+            "gpus": runtime_info["gpus"],
+
+            # Existing worker information
+            "vram": (
+                model_manager.get_vram_status()
+                if hasattr(model_manager, "get_vram_status")
+                else {}
+            ),
+            "storage": (
+                model_manager.get_available_storage()
+                if hasattr(model_manager, "get_available_storage")
+                else {}
+            ),
+            "installed_models": (
+                model_manager.get_installed_models()
+                if hasattr(model_manager, "get_installed_models")
+                else []
+            ),
+
+            # Runtime capabilities
+            "capabilities": {
+                "clip_ranking": True,
+                "video_generation": True,
+                "cuda": runtime_info["gpu_count"] > 0,
+                "multi_gpu": runtime_info["gpu_count"] > 1,
+            },
+        }
+
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+          return {
+            "status": "error",
+            "error": str(e),
+        }
 
     @app.get("/models")
     async def get_models():
