@@ -9,6 +9,7 @@ import sys
 import os
 from app import cache_manager
 from app import runtime_manager
+from app import capability_manager
 
 def install_requirements():
     """Install required packages"""
@@ -86,6 +87,7 @@ def main():
     mount_google_drive()
     cache_manager.initialize_cache()
     runtime_manager.print_runtime_report(role="main")
+    capability_manager.print_capability_report()
     launch_app()
 
 
