@@ -69,13 +69,14 @@ def write_main_endpoint(
 
 def read_main_endpoint():
     """
-    Read the Main endpoint from Drive.
+    Read the latest Main API endpoint from Google Drive.
 
-    Returns None when:
-    - Drive is unavailable
-    - endpoint file does not exist
-    - endpoint data is invalid
-    - endpoint is stale
+    The endpoint is NOT rejected just because it is old.
+    The caller is responsible for testing whether the URL
+    is actually reachable.
+
+    Returns:
+        dict | None
     """
 
     if not is_drive_available():
@@ -100,16 +101,23 @@ def read_main_endpoint():
 
         age = time.time() - float(updated_at)
 
-        if age > MAX_ENDPOINT_AGE:
+        data["age"] = age
+        data["is_stale"] = age > MAX_ENDPOINT_AGE
+
+        if data["is_stale"]:
             print(
-                f"⚠️ Main endpoint is stale "
+                f"⚠️ Main endpoint is old "
                 f"({age:.1f}s old)."
             )
-            return None
+            print("   URL will still be tested before use.")
+        else:
+            print(
+                f"✅ Main endpoint found "
+                f"({age:.1f}s old)."
+            )
 
         return data
 
     except Exception as e:
         print(f"❌ Failed to read Main endpoint: {e}")
         return None
-    
