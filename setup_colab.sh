@@ -1,4 +1,3 @@
-%%writefile setup_colab.sh
 #!/bin/bash
 
 # ================================================================
@@ -6,20 +5,32 @@
 # ================================================================
 # COLAB MASTERING ENVIRONMENT
 #
-# Purpose:
-#   - Receive raw videos from Kaggle
-#   - RIFE frame interpolation
-#   - Real-ESRGAN AI upscaling
-#   - FFmpeg final encoding
+# Pipeline:
+#
+#   Kaggle raw video
+#          ↓
+#        RIFE
+#          ↓
+#   Frame interpolation
+#          ↓
+#    Real-ESRGAN
+#          ↓
+#      Upscaling
+#          ↓
+#       FFmpeg
+#          ↓
+#   Final 1080p master
 #
 # Target:
 #   Google Colab
 #   NVIDIA T4
-#   Existing CUDA-enabled PyTorch
+#   Python 3.13
 #
 # IMPORTANT:
-#   Do NOT reinstall torch/torchvision.
-#   Do NOT install the legacy PyPI BasicSR package.
+#   - Do NOT reinstall torch
+#   - Do NOT pip install BasicSR
+#   - Do NOT pip install Real-ESRGAN
+#   - Use source repositories directly
 # ================================================================
 
 set -e
@@ -29,12 +40,16 @@ set -e
 # CONFIGURATION
 # ================================================================
 
-RIFE_REPO="https://github.com/hzwer/Practical-RIFE.git"
 REALESRGAN_REPO="https://github.com/xinntao/Real-ESRGAN.git"
+BASICSR_REPO="https://github.com/XPixelGroup/BasicSR.git"
+RIFE_REPO="https://github.com/hzwer/Practical-RIFE.git"
+
+REALESRGAN_DIR="realesrgan_repo"
+BASICSR_DIR="basicsr_repo"
+RIFE_DIR="rife_repo"
 
 REALESRGAN_MODEL="RealESRGAN_x4plus.pth"
 
-RIFE_DIR="rife_repo"
 RIFE_CHECKPOINT_DIR="train_log"
 
 STATUS_DIR="master_status"
@@ -73,15 +88,20 @@ if not torch.cuda.is_available():
         "Switch Colab runtime to NVIDIA T4."
     )
 
-gpu = torch.cuda.get_device_name(0)
-
-vram = (
-    torch.cuda.get_device_properties(0).total_memory
-    / 1024**3
+print(
+    "GPU    :",
+    torch.cuda.get_device_name(0)
 )
 
-print("GPU    :", gpu)
-print("VRAM   :", round(vram, 2), "GB")
+print(
+    "VRAM   :",
+    round(
+        torch.cuda.get_device_properties(0).total_memory
+        / 1024**3,
+        2
+    ),
+    "GB"
+)
 
 PY
 
@@ -90,11 +110,11 @@ echo "GPU environment OK."
 
 
 # ================================================================
-# 2. INSTALL MASTERING RUNTIME DEPENDENCIES
+# 2. INSTALL ONLY RUNTIME DEPENDENCIES
 # ================================================================
 
 echo ""
-echo "[2/8] Installing mastering dependencies..."
+echo "[2/8] Installing mastering runtime dependencies..."
 
 pip install -q \
     opencv-python-headless \
@@ -107,82 +127,150 @@ pip install -q \
     google-auth \
     google-auth-httplib2
 
-echo "Dependencies installed."
+echo "Runtime dependencies installed."
 
 
 # ================================================================
-# 3. INSTALL REAL-ESRGAN
+# 3. PREPARE BASICSR SOURCE
 # ================================================================
 
 echo ""
-echo "[3/8] Preparing Real-ESRGAN..."
+echo "[3/8] Preparing BasicSR source..."
 
 #
-# We intentionally DO NOT run:
+# DO NOT:
 #
 #     pip install basicsr
 #
-# BasicSR's legacy setup.py installation is incompatible
-# with the modern Python environment used by Colab.
+# BasicSR's legacy setup.py causes the Python 3.13
+# metadata-generation failure.
 #
-# Real-ESRGAN is installed from source without dependency
-# resolution so pip does not pull the broken legacy BasicSR
-# package automatically.
+# Instead we clone the source and import it directly.
 #
 
-if python -c "import realesrgan" >/dev/null 2>&1; then
+if [ -d "$BASICSR_DIR/.git" ]; then
 
-    echo "Real-ESRGAN already importable."
-    echo "Skipping installation."
+    echo "BasicSR repository already exists."
+    echo "Skipping clone."
 
 else
 
-    echo "Installing Real-ESRGAN from source..."
+    if [ -d "$BASICSR_DIR" ]; then
+        rm -rf "$BASICSR_DIR"
+    fi
 
-    pip install -q \
-        --no-deps \
-        --no-build-isolation \
-        "git+${REALESRGAN_REPO}"
+    echo "Cloning BasicSR source..."
+
+    git clone \
+        --depth 1 \
+        "$BASICSR_REPO" \
+        "$BASICSR_DIR"
 
 fi
 
+echo "BasicSR source ready."
+
 
 # ================================================================
-# REAL-ESRGAN IMPORT TEST
+# 4. PREPARE REAL-ESRGAN SOURCE
 # ================================================================
 
 echo ""
-echo "Testing Real-ESRGAN import..."
+echo "[4/8] Preparing Real-ESRGAN source..."
 
-if python -c "import realesrgan" >/dev/null 2>&1; then
+#
+# DO NOT pip install Real-ESRGAN.
+#
+# We use the repository source directly.
+#
 
-    echo "Real-ESRGAN import: OK"
+if [ -d "$REALESRGAN_DIR/.git" ]; then
+
+    echo "Real-ESRGAN repository already exists."
+    echo "Skipping clone."
 
 else
 
-    echo ""
-    echo "ERROR: Real-ESRGAN cannot be imported."
-    echo ""
-    echo "Detailed error:"
-    echo ""
+    if [ -d "$REALESRGAN_DIR" ]; then
+        rm -rf "$REALESRGAN_DIR"
+    fi
 
-    python -c "import realesrgan"
+    echo "Cloning Real-ESRGAN source..."
 
-    exit 1
+    git clone \
+        --depth 1 \
+        "$REALESRGAN_REPO" \
+        "$REALESRGAN_DIR"
 
 fi
 
+echo "Real-ESRGAN source ready."
+
 
 # ================================================================
-# 4. DOWNLOAD REAL-ESRGAN MODEL
+# ADD SOURCE REPOSITORIES TO PYTHON PATH
 # ================================================================
 
 echo ""
-echo "[4/8] Checking Real-ESRGAN x4plus model..."
+echo "Configuring Python source paths..."
+
+export PYTHONPATH="$(pwd)/$BASICSR_DIR:$(pwd)/$REALESRGAN_DIR:${PYTHONPATH:-}"
+
+echo "PYTHONPATH configured."
+
+
+# ================================================================
+# TEST BASICSR SOURCE
+# ================================================================
+
+echo ""
+echo "Testing BasicSR source import..."
+
+python - <<'PY'
+
+import sys
+
+print("Python path:")
+for p in sys.path:
+    print("  ", p)
+
+import basicsr
+
+print("")
+print("BasicSR source import: OK")
+print("BasicSR path:", basicsr.__file__)
+
+PY
+
+
+# ================================================================
+# TEST REAL-ESRGAN SOURCE
+# ================================================================
+
+echo ""
+echo "Testing Real-ESRGAN source import..."
+
+python - <<'PY'
+
+import realesrgan
+
+print("Real-ESRGAN source import: OK")
+print("Real-ESRGAN path:", realesrgan.__file__)
+
+PY
+
+
+# ================================================================
+# 5. REAL-ESRGAN MODEL
+# ================================================================
+
+echo ""
+echo "[5/8] Checking Real-ESRGAN x4plus model..."
 
 if [ -s "$REALESRGAN_MODEL" ]; then
 
     echo "$REALESRGAN_MODEL already exists."
+
     ls -lh "$REALESRGAN_MODEL"
 
 else
@@ -204,31 +292,29 @@ else
     fi
 
     echo ""
-    echo "Model downloaded:"
+    echo "Real-ESRGAN model downloaded."
+
     ls -lh "$REALESRGAN_MODEL"
 
 fi
 
 
 # ================================================================
-# 5. CLONE PRACTICAL-RIFE
+# 6. PRACTICAL-RIFE
 # ================================================================
 
 echo ""
-echo "[5/8] Preparing Practical-RIFE..."
+echo "[6/8] Preparing Practical-RIFE..."
 
 if [ -d "$RIFE_DIR/.git" ]; then
 
-    echo "Practical-RIFE already cloned."
+    echo "Practical-RIFE already exists."
     echo "Skipping clone."
 
 else
 
     if [ -d "$RIFE_DIR" ]; then
-
-        echo "Removing incomplete RIFE directory..."
         rm -rf "$RIFE_DIR"
-
     fi
 
     echo "Cloning Practical-RIFE..."
@@ -240,62 +326,41 @@ else
 
 fi
 
-echo "RIFE repository ready."
+echo "Practical-RIFE repository ready."
 
 
 # ================================================================
-# 6. PREPARE RIFE CHECKPOINT DIRECTORY
+# RIFE CHECKPOINT
 # ================================================================
 
 echo ""
-echo "[6/8] Preparing RIFE checkpoint..."
+echo "Checking RIFE checkpoint..."
 
 mkdir -p "$RIFE_CHECKPOINT_DIR"
-
-
-# ------------------------------------------------
-# Check existing checkpoint
-# ------------------------------------------------
 
 if [ -n "$(find "$RIFE_CHECKPOINT_DIR" -type f -print -quit 2>/dev/null)" ]; then
 
     echo "RIFE checkpoint already exists."
 
-# ------------------------------------------------
-# Check repository checkpoint
-# ------------------------------------------------
-
 elif [ -d "$RIFE_DIR/train_log" ] && \
      [ -n "$(find "$RIFE_DIR/train_log" -type f -print -quit 2>/dev/null)" ]; then
 
-    echo "RIFE checkpoint found inside repository."
-    echo "Copying checkpoint..."
+    echo "Found checkpoint inside RIFE repository."
 
     cp -r \
         "$RIFE_DIR/train_log/." \
         "$RIFE_CHECKPOINT_DIR/"
 
-# ------------------------------------------------
-# Check model directory
-# ------------------------------------------------
-
-elif [ -d "$RIFE_DIR/train_log" ]; then
-
-    echo "RIFE train_log directory exists."
-    echo "Checking for checkpoint files..."
-
-    find "$RIFE_DIR/train_log" -type f | head -20 || true
-
 else
 
     echo ""
     echo "WARNING:"
-    echo "RIFE pretrained checkpoint was not found."
+    echo "RIFE pretrained checkpoint was NOT found."
     echo ""
-    echo "Repository:"
+    echo "Repository exists:"
     echo "    $RIFE_DIR/"
     echo ""
-    echo "Expected checkpoint directory:"
+    echo "Checkpoint directory:"
     echo "    $RIFE_CHECKPOINT_DIR/"
     echo ""
 
@@ -315,7 +380,6 @@ if command -v ffmpeg >/dev/null 2>&1; then
 
 else
 
-    echo "FFmpeg not found."
     echo "Installing FFmpeg..."
 
     apt-get update -qq
@@ -328,7 +392,7 @@ ffmpeg -version | head -1
 
 
 # ================================================================
-# 8. FINAL ENVIRONMENT VERIFICATION
+# 8. FINAL VERIFICATION
 # ================================================================
 
 echo ""
@@ -339,18 +403,16 @@ echo ""
 
 
 # ------------------------------------------------
-# Python / GPU
+# GPU
 # ------------------------------------------------
 
 python - <<'PY'
 
-import sys
 import torch
 
-print("Python :", sys.version.split()[0])
-print("PyTorch:", torch.__version__)
-print("CUDA   :", torch.version.cuda)
-print("GPU    :", torch.cuda.get_device_name(0))
+print("GPU      :", torch.cuda.get_device_name(0))
+print("CUDA     :", torch.version.cuda)
+print("PyTorch  :", torch.__version__)
 
 PY
 
@@ -363,7 +425,21 @@ python - <<'PY'
 
 import cv2
 
-print("OpenCV :", cv2.__version__)
+print("OpenCV   :", cv2.__version__)
+
+PY
+
+
+# ------------------------------------------------
+# BasicSR
+# ------------------------------------------------
+
+python - <<'PY'
+
+import basicsr
+
+print("BasicSR  : OK")
+print("Path     :", basicsr.__file__)
 
 PY
 
@@ -374,22 +450,16 @@ PY
 
 python - <<'PY'
 
-try:
+import realesrgan
 
-    import realesrgan
-
-    print("RealESRGAN : OK")
-
-except Exception as e:
-
-    print("RealESRGAN : FAILED")
-    print("Error      :", e)
+print("ESRGAN   : OK")
+print("Path     :", realesrgan.__file__)
 
 PY
 
 
 # ------------------------------------------------
-# Real-ESRGAN model
+# Real-ESRGAN MODEL
 # ------------------------------------------------
 
 echo ""
@@ -397,8 +467,8 @@ echo "Real-ESRGAN model:"
 
 if [ -s "$REALESRGAN_MODEL" ]; then
 
-    ls -lh "$REALESRGAN_MODEL"
     echo "STATUS: FOUND"
+    ls -lh "$REALESRGAN_MODEL"
 
 else
 
@@ -408,7 +478,7 @@ fi
 
 
 # ------------------------------------------------
-# RIFE repository
+# RIFE
 # ------------------------------------------------
 
 echo ""
@@ -417,7 +487,6 @@ echo "RIFE repository:"
 if [ -d "$RIFE_DIR" ]; then
 
     echo "STATUS: FOUND"
-    echo "PATH  : $RIFE_DIR"
 
 else
 
@@ -427,7 +496,7 @@ fi
 
 
 # ------------------------------------------------
-# RIFE checkpoint
+# RIFE CHECKPOINT
 # ------------------------------------------------
 
 echo ""
@@ -437,21 +506,18 @@ if [ -n "$(find "$RIFE_CHECKPOINT_DIR" -type f -print -quit 2>/dev/null)" ]; the
 
     echo "STATUS: FOUND"
     echo ""
-    echo "Checkpoint files:"
+
     find "$RIFE_CHECKPOINT_DIR" -type f | head -20
 
 else
 
     echo "STATUS: MISSING"
-    echo ""
-    echo "RIFE checkpoint must be added before"
-    echo "the mastering pipeline can run interpolation."
 
 fi
 
 
 # ------------------------------------------------
-# FFmpeg
+# FFMPEG
 # ------------------------------------------------
 
 echo ""
@@ -469,14 +535,14 @@ fi
 
 
 # ================================================================
-# CREATE STATUS DIRECTORY
+# STATUS DIRECTORY
 # ================================================================
 
 mkdir -p "$STATUS_DIR"
 
 
 # ================================================================
-# SETUP COMPLETE
+# COMPLETE
 # ================================================================
 
 echo ""
@@ -485,27 +551,23 @@ echo " SETUP COMPLETE"
 echo "================================================"
 echo ""
 
-echo "Environment:"
-echo "  Python       : READY"
-echo "  PyTorch      : READY"
-echo "  CUDA         : READY"
-echo "  Real-ESRGAN  : CHECK ABOVE"
-echo "  RIFE         : CHECK ABOVE"
-echo "  FFmpeg       : CHECK ABOVE"
-
+echo "Mastering stack:"
 echo ""
-echo "Required assets:"
-echo "  RealESRGAN_x4plus.pth"
-echo "  rife_repo/"
-echo "  train_log/"
+echo "  PyTorch       : READY"
+echo "  CUDA/T4       : READY"
+echo "  BasicSR       : SOURCE"
+echo "  Real-ESRGAN   : SOURCE"
+echo "  ESRGAN Model  : CHECK ABOVE"
+echo "  RIFE          : CHECK ABOVE"
+echo "  RIFE Model    : CHECK ABOVE"
+echo "  FFmpeg        : CHECK ABOVE"
 echo ""
 
-echo "Next pipeline stage:"
+echo "Do NOT run colab_master.py yet."
 echo ""
-echo "  1. Test RIFE"
-echo "  2. Test Real-ESRGAN"
-echo "  3. Test FFmpeg"
-echo "  4. Test colab_master.py"
-echo "  5. Process Kaggle raw assets"
-echo "  6. Generate final 1080p master"
+echo "Next:"
+echo "  1. RIFE standalone test"
+echo "  2. Real-ESRGAN standalone test"
+echo "  3. FFmpeg test"
+echo "  4. Full mastering test"
 echo ""
