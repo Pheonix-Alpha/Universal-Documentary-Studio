@@ -73,7 +73,10 @@ def update_status(gpu_id, **fields):
 
 def read_status():
     with _status_lock:
-        return json.loads(json.dumps(_status))
+        return {
+            0: dict(_status[0]),
+            1: dict(_status[1]),
+        }
 
 
 def format_status_text():
