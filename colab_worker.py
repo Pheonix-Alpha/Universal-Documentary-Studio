@@ -10,7 +10,13 @@ import os
 import sys
 import subprocess
 
-REQUIRED_PIP = ["opencv-python", "basicsr", "realesrgan", "numpy"]
+# opencv/numpy build cleanly under normal pip build isolation.
+PLAIN_PIP = ["opencv-python", "numpy<2"]
+# basicsr/realesrgan's setup.py needs `torch` importable *during the build*,
+# which pip's isolated build env does not provide -> egg_info fails unless
+# we disable build isolation so they build against the already-installed
+# (Colab-provided) torch instead.
+TORCH_DEPENDENT_PIP = ["basicsr", "realesrgan"]
 
 
 def ensure_requirements():
@@ -19,7 +25,12 @@ def ensure_requirements():
         print("[setup] Worker deps already installed, skipping.")
     else:
         print("[setup] Installing colab_worker dependencies...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *REQUIRED_PIP], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "setuptools", "wheel"], check=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *PLAIN_PIP], check=True)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", *TORCH_DEPENDENT_PIP],
+            check=True,
+        )
         with open(marker, "w") as f:
             f.write("ok")
         print("[setup] Done.")
@@ -39,9 +50,21 @@ def ensure_requirements():
 
 ensure_requirements()
 
+import types
 import cv2
 import torch
 import numpy as np
+import torchvision.transforms.functional as _tv_functional
+
+# basicsr (an unmaintained dependency of realesrgan) imports
+# torchvision.transforms.functional_tensor, which newer torchvision removed
+# in favor of torchvision.transforms.functional. Inject a compatibility
+# shim module so that import succeeds without patching basicsr's source.
+if "torchvision.transforms.functional_tensor" not in sys.modules:
+    _shim = types.ModuleType("torchvision.transforms.functional_tensor")
+    _shim.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = _shim
+
 from realesrgan import RealESRGANer
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
