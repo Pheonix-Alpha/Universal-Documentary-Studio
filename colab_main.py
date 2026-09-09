@@ -5,10 +5,16 @@ Run this on Colab (single T4, internet ON).
 
 1. Installs its own requirements and loads Real-ESRGAN/RIFE into VRAM once.
 2. Takes a Kaggle worker URL as input and heartbeats it before doing anything.
-3. Sends prompts to the Kaggle worker, auto-downloads the two raw clips it returns.
-4. Runs the local mastering pipeline (colab_worker.py) on each clip.
+3. Takes ONE prompt from you, auto-splits it into a first-half / second-half
+   pair, and sends both to the Kaggle worker to render concurrently
+   (one segment per GPU).
+4. Stitches the two returned segments into one continuous raw clip, then
+   runs the local mastering pipeline (colab_worker.py) to produce a single
+   1080p/24fps final video.
 
 colab_worker.py must sit next to this file (same folder) so it can be imported.
+Kaggle stays headless -- there is no prompt UI there, everything is driven
+from here.
 """
 
 import os
@@ -75,45 +81,75 @@ def heartbeat_monitor(client, stop_event, interval=15):
 
 
 # ---------------------------------------------------------------------------
-# 4. Full pipeline: generate on Kaggle -> download -> master locally
+# 4. Single prompt -> two consecutive segment prompts
 # ---------------------------------------------------------------------------
-def run_pipeline(kaggle_url, prompt_left, prompt_right, out_dir="/content/output"):
+def build_two_part_prompts(user_prompt):
+    """
+    Splits one user prompt into a first-half / second-half pair so GPU0 and
+    GPU1 can render both segments concurrently, which are then stitched into
+    one longer clip.
+
+    CogVideoX renders each half independently -- there's no frame-level
+    conditioning carried from segment 1 into segment 2 -- so the stitch point
+    is a hard cut, not a seamless continuous shot. Keeping both halves
+    describing the same subject/setting (rather than two unrelated scenes)
+    is what keeps that cut from looking jarring.
+    """
+    lowered = user_prompt.lower()
+    for cue in (" then ", " and then ", "; "):
+        if cue in lowered:
+            idx = lowered.index(cue)
+            part1 = user_prompt[:idx].strip().rstrip(",;")
+            part2 = user_prompt[idx + len(cue):].strip()
+            if part1 and part2:
+                return part1, part2
+    # No explicit sequencing cue in the prompt -- auto-wrap as two beats
+    # of the same scene instead of guessing where to cut it.
+    part1 = f"{user_prompt}, opening moment, establishing shot"
+    part2 = f"{user_prompt}, continuing the same scene, a moment later"
+    return part1, part2
+
+
+# ---------------------------------------------------------------------------
+# 5. Full pipeline: split -> generate on Kaggle (parallel) -> stitch -> master
+# ---------------------------------------------------------------------------
+def run_pipeline(kaggle_url, user_prompt, out_dir="/content/output"):
     os.makedirs(out_dir, exist_ok=True)
     client = connect_to_kaggle(kaggle_url)
+
+    part1_prompt, part2_prompt = build_two_part_prompts(user_prompt)
+    print(f"[pipeline] Segment 1 (GPU0): {part1_prompt}")
+    print(f"[pipeline] Segment 2 (GPU1): {part2_prompt}")
 
     stop_event = threading.Event()
     hb_thread = threading.Thread(target=heartbeat_monitor, args=(client, stop_event), daemon=True)
     hb_thread.start()
 
     try:
-        print("[pipeline] Requesting dual-GPU render from Kaggle...")
-        # gradio_client downloads the returned video files locally and hands back their paths
-        raw_gpu0_path, raw_gpu1_path = client.predict(
-            prompt_left, prompt_right, api_name="/generate"
+        print("[pipeline] Rendering both segments concurrently on Kaggle...")
+        raw_part1_path, raw_part2_path = client.predict(
+            part1_prompt, part2_prompt, api_name="/generate"
         )
-        print(f"[pipeline] Received raw clips:\n  {raw_gpu0_path}\n  {raw_gpu1_path}")
+        print(f"[pipeline] Received segments:\n  {raw_part1_path}\n  {raw_part2_path}")
     finally:
         stop_event.set()
         hb_thread.join(timeout=2)
 
-    outputs = []
-    for i, raw_path in enumerate([raw_gpu0_path, raw_gpu1_path]):
-        final_path = os.path.join(out_dir, f"final_1080p_master_{i}.mp4")
-        colab_worker.process_and_upscale_stream(raw_path, final_path)
-        outputs.append(final_path)
+    stitched_path = os.path.join(out_dir, "raw_stitched.mp4")
+    colab_worker.stitch_clips(raw_part1_path, raw_part2_path, stitched_path)
 
-    print("[pipeline] Complete. Final masters:\n  " + "\n  ".join(outputs))
-    return outputs
+    final_path = os.path.join(out_dir, "final_1080p_master.mp4")
+    colab_worker.process_and_upscale_stream(stitched_path, final_path)
+
+    print(f"[pipeline] Complete. Final master:\n  {final_path}")
+    return final_path
 
 
 # ---------------------------------------------------------------------------
-# 5. Entry point
+# 6. Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     kaggle_url = input("Paste the Kaggle worker public URL (from kaggle_worker.py): ").strip()
-    prompt_left = input("Prompt for GPU 0 [default astronaut]: ").strip() or \
-        "Vector sticker of an astronaut, whiteboard background, flat design"
-    prompt_right = input("Prompt for GPU 1 [default rocket]: ").strip() or \
-        "Vector sticker of a rocket ship, whiteboard background, flat design"
+    user_prompt = input("Describe the video you want: ").strip()
 
-    run_pipeline(kaggle_url, prompt_left, prompt_right)
+    run_pipeline(kaggle_url, user_prompt)

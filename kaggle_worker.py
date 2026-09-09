@@ -136,22 +136,27 @@ def generate(prompt_left, prompt_right, progress=gr.Progress()):
 # 4. Gradio app -- the visible UI is optional; what matters is the API routes
 # ---------------------------------------------------------------------------
 with gr.Blocks(theme=gr.themes.Glass()) as app:
-    gr.Markdown("# Kaggle Dual-GPU Worker")
-    gr.Markdown("Copy the public URL Gradio prints below into `colab_main.py`.")
+    gr.Markdown(
+        "# Kaggle Dual-GPU Worker (headless)\n\n"
+        "This worker is driven entirely via API from `colab_main.py` -- "
+        "there's nothing to fill in here. Copy the public URL Gradio prints "
+        "in the console below and paste it into Colab when it asks."
+    )
+    status_box = gr.JSON(label="Live health status", value=health_check)
 
-    with gr.Row():
-        p0 = gr.Textbox(label="Prompt for GPU 0", value="Vector sticker of an astronaut, whiteboard background")
-        p1 = gr.Textbox(label="Prompt for GPU 1", value="Vector sticker of a rocket ship, whiteboard background")
-    btn = gr.Button("Run Dual Render (manual test)", variant="primary")
-    out0 = gr.Video(label="Raw GPU0 clip")
-    out1 = gr.Video(label="Raw GPU1 clip")
-    btn.click(fn=generate, inputs=[p0, p1], outputs=[out0, out1], api_name="generate")
-
-    # Hidden row purely to publish a /health API route for the Colab heartbeat
+    # Hidden components exist purely to publish /generate and /health as
+    # API routes for gradio_client -- no visible inputs, Colab is the UI.
     with gr.Row(visible=False):
-        health_btn = gr.Button("health")
+        p0 = gr.Textbox()
+        p1 = gr.Textbox()
+        out0 = gr.Video()
+        out1 = gr.Video()
+        gen_trigger = gr.Button()
+        health_trigger = gr.Button()
         health_out = gr.JSON()
-    health_btn.click(fn=health_check, outputs=health_out, api_name="health")
+
+    gen_trigger.click(fn=generate, inputs=[p0, p1], outputs=[out0, out1], api_name="generate")
+    health_trigger.click(fn=health_check, outputs=health_out, api_name="health")
 
 if __name__ == "__main__":
     app.launch(share=True)

@@ -10,12 +10,17 @@ import os
 import sys
 import subprocess
 
-# opencv/numpy build cleanly under normal pip build isolation.
-PLAIN_PIP = ["opencv-python", "numpy<2"]
+# Plain runtime deps basicsr/realesrgan actually need -- listed explicitly so
+# we can install with --no-deps below and skip their unused face-restoration
+# extras (facexlib/gfpgan), which are heavy and irrelevant to video upscaling.
+PLAIN_PIP = [
+    "numpy<2", "opencv-python", "addict", "future", "lmdb",
+    "pyyaml", "requests", "scipy", "tqdm", "yapf", "tb-nightly",
+]
 # basicsr/realesrgan's setup.py needs `torch` importable *during the build*,
 # which pip's isolated build env does not provide -> egg_info fails unless
 # we disable build isolation so they build against the already-installed
-# (Colab-provided) torch instead.
+# (Colab-provided) torch instead. --no-deps skips gfpgan/facexlib.
 TORCH_DEPENDENT_PIP = ["basicsr", "realesrgan"]
 
 
@@ -25,10 +30,10 @@ def ensure_requirements():
         print("[setup] Worker deps already installed, skipping.")
     else:
         print("[setup] Installing colab_worker dependencies...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "setuptools", "wheel"], check=True)
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", *PLAIN_PIP], check=True)
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", *TORCH_DEPENDENT_PIP],
+            [sys.executable, "-m", "pip", "install", "-q",
+             "--no-build-isolation", "--no-deps", *TORCH_DEPENDENT_PIP],
             check=True,
         )
         with open(marker, "w") as f:
@@ -98,6 +103,40 @@ def load_models(esrgan_weights_path="RealESRGAN_x4plus.pth", rife_dir="/content/
     rife_model.device()
     _MODELS["rife"] = rife_model
     print("[models] Real-ESRGAN + RIFE resident in VRAM.")
+
+
+def stitch_clips(path_a, path_b, output_path):
+    """
+    Concatenates two raw clips frame-by-frame into one continuous file.
+    Assumes both share the same fps/resolution, which holds here since both
+    come from the same model on the same worker. Note: this is a hard cut
+    at the join, not motion-conditioned continuity -- CogVideoX renders each
+    half independently.
+    """
+    probe = cv2.VideoCapture(path_a)
+    if not probe.isOpened():
+        raise IOError(f"Could not open clip: {path_a}")
+    fps = probe.get(cv2.CAP_PROP_FPS) or 8
+    w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe.release()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    for path in (path_a, path_b):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            out.release()
+            raise IOError(f"Could not open clip: {path}")
+        success, frame = cap.read()
+        while success:
+            out.write(frame)
+            success, frame = cap.read()
+        cap.release()
+
+    out.release()
+    print(f"[stitch] Combined {path_a} + {path_b} -> {output_path}")
 
 
 def process_and_upscale_stream(input_path, output_path, target_size=(1920, 1080), target_fps=24):
