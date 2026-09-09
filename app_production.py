@@ -1,31 +1,30 @@
 """
 Kaggle Dual-T4 Text-to-Video Generation Engine
 ================================================
-Genuinely parallel CogVideoX-2b inference across cuda:0 and cuda:1,
-with:
+Parallel CogVideoX-2b inference across cuda:0 and cuda:1.
 
-  - A heartbeat/status system: each GPU worker (and the download/load
-    step before it) continuously writes {stage, progress, prompt,
-    last_heartbeat} to a shared status file. If the Gradio tab
-    disconnects and reconnects (or you just open the file directly),
-    you can immediately see what each GPU was doing and how recently
-    it last checked in — a stale `last_heartbeat` means that worker
-    has stalled or crashed, not just "still busy".
-
-  - Idempotent, parallel model preparation: on startup, both GPUs
-    check their local HF cache first. Only a GPU with a missing model
-    downloads it; only a pipeline not yet constructed gets built and
-    moved into VRAM. Both checks run in parallel threads so two cold
-    starts overlap instead of stacking sequentially, and re-running
-    setup mid-session is a no-op if everything is already in place.
+Features:
+  - Dual GPU rendering
+  - Live heartbeat/status system
+  - Idempotent model download
+  - Idempotent pipeline preparation
+  - Parallel GPU preparation
+  - Gradio live status timer
+  - Optional distributed queue
 """
 
 import os
 
-# Must happen before any diffusers/transformers/torch-hub import that
-# might trigger a download, or the redirect won't take effect.
+# ---------------------------------------------------------------
+# Hugging Face cache
+# ---------------------------------------------------------------
+
 os.environ["HF_HOME"] = "/tmp/hf_cache"
 os.makedirs("/tmp/hf_cache", exist_ok=True)
+
+# ---------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------
 
 import json
 import threading
@@ -33,208 +32,588 @@ import time
 
 import torch
 import gradio as gr
+
 from diffusers import CogVideoXPipeline
 from diffusers.utils import export_to_video
 from huggingface_hub import snapshot_download
 
+
+# ---------------------------------------------------------------
+# Optional distributed queue
+# ---------------------------------------------------------------
+
 try:
     from distributed_queue import Queue
 except ImportError:
-    Queue = None  # distributed mode is optional; local-only mode still works
+    Queue = None
 
-# Fill these in to enable distributed mode (see distributed_queue.py's
-# module docstring for the one-time Google Cloud + Drive setup). Leave
-# SERVICE_ACCOUNT_JSON as None to run in local-only mode, unchanged
-# from before, with no Colab hand-off.
-SERVICE_ACCOUNT_JSON = None  # e.g. "/kaggle/working/service_account.json"
-DRIVE_ROOT_FOLDER_ID = None  # e.g. "1AbCdEfGhIjKlMnOpQrSt"
+
+# ---------------------------------------------------------------
+# Distributed configuration
+# ---------------------------------------------------------------
+
+SERVICE_ACCOUNT_JSON = None
+DRIVE_ROOT_FOLDER_ID = None
 
 _queue = None
+
 if Queue and SERVICE_ACCOUNT_JSON and DRIVE_ROOT_FOLDER_ID:
-    _queue = Queue(SERVICE_ACCOUNT_JSON, DRIVE_ROOT_FOLDER_ID)
-    print("Distributed queue connected — renders will be handed off to Colab workers.")
+    _queue = Queue(
+        SERVICE_ACCOUNT_JSON,
+        DRIVE_ROOT_FOLDER_ID,
+    )
+
+    print(
+        "Distributed queue connected — "
+        "renders will be handed off to Colab workers."
+    )
+
 else:
-    print("Running in local-only mode (no distributed queue configured).")
+    print(
+        "Running in local-only mode "
+        "(no distributed queue configured)."
+    )
+
+
+# ===============================================================
+# Configuration
+# ===============================================================
 
 MODEL_ID = "THUDM/CogVideoX-2b"
-NUM_FRAMES = 49          # ~6s at 8fps
+
+NUM_FRAMES = 49
 NUM_STEPS = 50
+
 GUIDANCE_SCALE = 6.5
+
 FPS = 8
-HEARTBEAT_INTERVAL = 2  # seconds
+
+HEARTBEAT_INTERVAL = 2
+
 STATUS_FILE = "/tmp/pipeline_status.json"
 
-# ------------------------------------------------------------------
-# Shared status / heartbeat layer
-# ------------------------------------------------------------------
+
+# ===============================================================
+# Shared Status / Heartbeat
+# ===============================================================
+
 _status_lock = threading.Lock()
+
 _status = {
-    0: {"stage": "not_started", "progress": 0, "prompt": None, "last_heartbeat": None},
-    1: {"stage": "not_started", "progress": 0, "prompt": None, "last_heartbeat": None},
+    0: {
+        "stage": "not_started",
+        "progress": 0,
+        "prompt": None,
+        "last_heartbeat": None,
+    },
+    1: {
+        "stage": "not_started",
+        "progress": 0,
+        "prompt": None,
+        "last_heartbeat": None,
+    },
 }
 
 
-def update_status(gpu_id, **fields):
-    """Merge fields into this GPU's status, stamp the heartbeat, and
-    persist to disk (and to the shared queue, if configured) so any
-    process/tab/Colab worker reading current state sees it even after
-    a disconnect/reconnect."""
+def _status_snapshot():
+    """
+    Return a safe copy of the in-memory status.
+
+    IMPORTANT:
+    Do NOT use JSON round-tripping here because JSON converts
+    integer dictionary keys into strings.
+    """
+
     with _status_lock:
-        _status[gpu_id].update(fields)
-        _status[gpu_id]["last_heartbeat"] = time.time()
-        snapshot = json.loads(json.dumps(_status))  # cheap deep copy
+        return {
+            0: dict(_status[0]),
+            1: dict(_status[1]),
+        }
+
+
+def _write_status_file():
+    """
+    Persist status to disk.
+
+    JSON files necessarily store dictionary keys as strings.
+    Therefore read_status() must normalize them back to integers.
+    """
+
+    snapshot = _status_snapshot()
+
     try:
         with open(STATUS_FILE, "w") as f:
             json.dump(snapshot, f)
+
     except OSError:
-        pass  # disk hiccup shouldn't kill the worker
+        pass
+
+
+def update_status(gpu_id, **fields):
+    """
+    Update one GPU's status and heartbeat.
+    """
+
+    with _status_lock:
+
+        _status[gpu_id].update(fields)
+
+        _status[gpu_id]["last_heartbeat"] = time.time()
+
+        snapshot = {
+            0: dict(_status[0]),
+            1: dict(_status[1]),
+        }
+
+    # -----------------------------------------------------------
+    # Persist status
+    # -----------------------------------------------------------
+
+    try:
+
+        with open(STATUS_FILE, "w") as f:
+            json.dump(snapshot, f)
+
+    except OSError:
+        pass
+
+    # -----------------------------------------------------------
+    # Optional distributed heartbeat
+    # -----------------------------------------------------------
+
     if _queue:
+
         try:
+
             _queue.report_heartbeat(
                 node_id=f"kaggle-gpu{gpu_id}",
                 role="kaggle-generator",
                 stage=snapshot[gpu_id]["stage"],
                 progress=snapshot[gpu_id]["progress"],
-                extra={"prompt": snapshot[gpu_id]["prompt"]},
+                extra={
+                    "prompt": snapshot[gpu_id]["prompt"]
+                },
             )
+
         except Exception as e:
-            print(f"[queue heartbeat warning] {e}")
+
+            print(
+                f"[queue heartbeat warning] {e}"
+            )
+
     return snapshot
 
 
 def read_status():
+    """
+    Read current status.
+
+    IMPORTANT:
+    Always return integer GPU keys.
+
+    This prevents:
+
+        KeyError: 0
+
+    caused by JSON converting:
+
+        0 -> "0"
+        1 -> "1"
+    """
+
     with _status_lock:
-        return json.loads(json.dumps(_status))
+
+        return {
+            0: dict(_status[0]),
+            1: dict(_status[1]),
+        }
 
 
 def format_status_text():
+    """
+    Convert GPU status into readable UI text.
+    """
+
     now = time.time()
+
+    status = read_status()
+
     lines = []
+
     for gpu_id in (0, 1):
-        s = read_status()[gpu_id]
-        hb = s["last_heartbeat"]
-        if hb is None:
+
+        s = status[gpu_id]
+
+        heartbeat = s.get("last_heartbeat")
+
+        if heartbeat is None:
+
             age_str = "never"
+
         else:
-            age = now - hb
-            age_str = f"{age:.1f}s ago" + ("  [STALE]" if age > HEARTBEAT_INTERVAL * 4 else "")
-        prompt_str = f' — "{s["prompt"]}"' if s.get("prompt") else ""
-        lines.append(
-            f"GPU {gpu_id}: {s['stage']} ({s['progress']}%) — last heartbeat {age_str}{prompt_str}"
+
+            age = now - heartbeat
+
+            age_str = (
+                f"{age:.1f}s ago"
+            )
+
+            if age > HEARTBEAT_INTERVAL * 4:
+
+                age_str += "  [STALE]"
+
+        prompt = s.get("prompt")
+
+        prompt_str = (
+            f' — "{prompt}"'
+            if prompt
+            else ""
         )
 
+        lines.append(
+            f"GPU {gpu_id}: "
+            f"{s.get('stage', 'unknown')} "
+            f"({s.get('progress', 0)}%) "
+            f"— last heartbeat {age_str}"
+            f"{prompt_str}"
+        )
+
+    # -----------------------------------------------------------
+    # Distributed worker status
+    # -----------------------------------------------------------
+
     if _queue:
+
         try:
-            for node_id, s in sorted(_queue.list_all_status().items()):
+
+            all_status = _queue.list_all_status()
+
+            for node_id, worker_status in sorted(
+                all_status.items()
+            ):
+
                 if node_id.startswith("kaggle-gpu"):
-                    continue  # already shown above from local state
-                flag = "  [STALE]" if s["stale"] else ""
-                lines.append(
-                    f"{node_id} ({s['role']}): {s['stage']} "
-                    f"({s.get('progress')}) — last heartbeat {s['age_seconds']}s ago{flag}"
+
+                    continue
+
+                stale_flag = (
+                    "  [STALE]"
+                    if worker_status.get("stale")
+                    else ""
                 )
+
+                lines.append(
+                    f"{node_id} "
+                    f"({worker_status.get('role')})"
+                    f": "
+                    f"{worker_status.get('stage')}"
+                    f" "
+                    f"({worker_status.get('progress')})"
+                    f" — last heartbeat "
+                    f"{worker_status.get('age_seconds')}s ago"
+                    f"{stale_flag}"
+                )
+
         except Exception as e:
-            lines.append(f"[queue status unavailable: {e}]")
+
+            lines.append(
+                f"[queue status unavailable: {e}]"
+            )
 
     return "\n".join(lines)
 
 
+# ===============================================================
+# Background Heartbeat
+# ===============================================================
+
 def _heartbeat_loop(gpu_id, stop_event):
-    """Keeps last_heartbeat fresh between explicit progress updates,
-    so a hung worker (stuck inside a library call with no callback
-    firing) is visibly distinguishable from a busy one: the stage text
-    stops changing AND the heartbeat age starts climbing."""
+    """
+    Keeps the heartbeat alive while a GPU worker is running.
+    """
+
     while not stop_event.is_set():
+
         with _status_lock:
+
             _status[gpu_id]["last_heartbeat"] = time.time()
+
+            snapshot = {
+                0: dict(_status[0]),
+                1: dict(_status[1]),
+            }
+
         try:
+
             with open(STATUS_FILE, "w") as f:
-                json.dump(read_status(), f)
+
+                json.dump(
+                    snapshot,
+                    f,
+                )
+
         except OSError:
+
             pass
-        stop_event.wait(HEARTBEAT_INTERVAL)
+
+        stop_event.wait(
+            HEARTBEAT_INTERVAL
+        )
 
 
-# ------------------------------------------------------------------
-# Idempotent, parallel model download + VRAM load
-# ------------------------------------------------------------------
+# ===============================================================
+# Pipeline Management
+# ===============================================================
+
 _pipelines = {}
+
 _pipelines_lock = threading.Lock()
 
 
 def _ensure_downloaded(gpu_id):
-    """Skip the network entirely if the repo is already fully cached
-    locally; only hit the hub if something's missing."""
-    update_status(gpu_id, stage="checking_cache")
-    try:
-        snapshot_download(repo_id=MODEL_ID, cache_dir="/tmp/hf_cache", local_files_only=True)
-        update_status(gpu_id, stage="cache_hit")
-        return
-    except Exception:
-        pass  # not fully cached yet — fall through to a real download
+    """
+    Check whether CogVideoX is already cached.
 
-    update_status(gpu_id, stage="downloading_model")
-    snapshot_download(repo_id=MODEL_ID, cache_dir="/tmp/hf_cache")
-    update_status(gpu_id, stage="downloaded")
+    If cached:
+        no network request.
+
+    If missing:
+        download model.
+    """
+
+    update_status(
+        gpu_id,
+        stage="checking_cache",
+        progress=0,
+    )
+
+    try:
+
+        snapshot_download(
+            repo_id=MODEL_ID,
+            cache_dir="/tmp/hf_cache",
+            local_files_only=True,
+        )
+
+        update_status(
+            gpu_id,
+            stage="cache_hit",
+            progress=0,
+        )
+
+        return
+
+    except Exception:
+
+        pass
+
+    # -----------------------------------------------------------
+    # Download
+    # -----------------------------------------------------------
+
+    update_status(
+        gpu_id,
+        stage="downloading_model",
+        progress=0,
+    )
+
+    snapshot_download(
+        repo_id=MODEL_ID,
+        cache_dir="/tmp/hf_cache",
+    )
+
+    update_status(
+        gpu_id,
+        stage="downloaded",
+        progress=0,
+    )
 
 
 def _prepare_pipeline(gpu_id):
-    """Idempotent: if this GPU's pipeline is already built, return it
-    immediately without touching disk or VRAM again."""
+    """
+    Prepare CogVideoX pipeline for one GPU.
+
+    Idempotent:
+    if already loaded, return existing pipeline.
+    """
+
+    # -----------------------------------------------------------
+    # Already loaded?
+    # -----------------------------------------------------------
+
     with _pipelines_lock:
+
         if gpu_id in _pipelines:
-            update_status(gpu_id, stage="idle")
+
+            update_status(
+                gpu_id,
+                stage="idle",
+                progress=0,
+            )
+
             return _pipelines[gpu_id]
+
+    # -----------------------------------------------------------
+    # Ensure model exists
+    # -----------------------------------------------------------
 
     _ensure_downloaded(gpu_id)
 
-    update_status(gpu_id, stage="loading_into_vram")
-    pipe = CogVideoXPipeline.from_pretrained(
-        MODEL_ID, torch_dtype=torch.float16, cache_dir="/tmp/hf_cache"
+    # -----------------------------------------------------------
+    # Load model
+    # -----------------------------------------------------------
+
+    update_status(
+        gpu_id,
+        stage="loading_into_vram",
+        progress=0,
     )
-    # Per-instance offload bound to a specific device — true dual-GPU
-    # isolation without either pipe fighting for the other's memory.
-    pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+
+    pipe = CogVideoXPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        cache_dir="/tmp/hf_cache",
+    )
+
+    # -----------------------------------------------------------
+    # GPU-specific CPU offload
+    # -----------------------------------------------------------
+
+    pipe.enable_model_cpu_offload(
+        gpu_id=gpu_id
+    )
+
+    # -----------------------------------------------------------
+    # VAE memory optimization
+    # -----------------------------------------------------------
+
     pipe.vae.enable_slicing()
+
     pipe.vae.enable_tiling()
 
+    # -----------------------------------------------------------
+    # Store pipeline
+    # -----------------------------------------------------------
+
     with _pipelines_lock:
+
         _pipelines[gpu_id] = pipe
 
-    update_status(gpu_id, stage="idle", progress=0)
+    update_status(
+        gpu_id,
+        stage="idle",
+        progress=0,
+    )
+
     return pipe
 
 
 def ensure_pipelines_ready():
-    """Runs both GPUs' download+load in parallel threads. Call once at
-    startup; safe to call again later since each side is idempotent."""
-    print("Preparing both pipelines (parallel download/load)...")
-    threads = [
-        threading.Thread(target=_prepare_pipeline, args=(0,)),
-        threading.Thread(target=_prepare_pipeline, args=(1,)),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    print("Both pipelines ready.")
+    """
+    Prepare both GPU pipelines in parallel.
+    """
+
+    print(
+        "Preparing both pipelines "
+        "(parallel download/load)..."
+    )
+
+    thread_gpu0 = threading.Thread(
+        target=_prepare_pipeline,
+        args=(0,),
+        name="prepare-gpu0",
+    )
+
+    thread_gpu1 = threading.Thread(
+        target=_prepare_pipeline,
+        args=(1,),
+        name="prepare-gpu1",
+    )
+
+    thread_gpu0.start()
+    thread_gpu1.start()
+
+    thread_gpu0.join()
+    thread_gpu1.join()
+
+    print(
+        "Both pipelines ready."
+    )
 
 
-# ------------------------------------------------------------------
+# ===============================================================
 # Generation
-# ------------------------------------------------------------------
-def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
+# ===============================================================
+
+def render_on_gpu(
+    prompt,
+    gpu_id,
+    output_filename,
+    result_dict,
+):
+
     stop_event = threading.Event()
-    hb_thread = threading.Thread(target=_heartbeat_loop, args=(gpu_id, stop_event), daemon=True)
-    hb_thread.start()
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(
+            gpu_id,
+            stop_event,
+        ),
+        daemon=True,
+        name=f"heartbeat-gpu{gpu_id}",
+    )
+
+    heartbeat_thread.start()
 
     try:
-        pipe = _prepare_pipeline(gpu_id)  # no-op if already loaded
-        update_status(gpu_id, stage="generating", progress=0, prompt=prompt)
 
-        def step_callback(pipeline, step, timestep, callback_kwargs):
-            update_status(gpu_id, stage="generating", progress=int((step / NUM_STEPS) * 100))
+        # -------------------------------------------------------
+        # Get pipeline
+        # -------------------------------------------------------
+
+        pipe = _prepare_pipeline(
+            gpu_id
+        )
+
+        # -------------------------------------------------------
+        # Start generation
+        # -------------------------------------------------------
+
+        update_status(
+            gpu_id,
+            stage="generating",
+            progress=0,
+            prompt=prompt,
+        )
+
+        # -------------------------------------------------------
+        # Generation callback
+        # -------------------------------------------------------
+
+        def step_callback(
+            pipeline,
+            step,
+            timestep,
+            callback_kwargs,
+        ):
+
+            progress_value = int(
+                (step / NUM_STEPS) * 100
+            )
+
+            update_status(
+                gpu_id,
+                stage="generating",
+                progress=progress_value,
+                prompt=prompt,
+            )
+
             return callback_kwargs
+
+        # -------------------------------------------------------
+        # Run CogVideoX
+        # -------------------------------------------------------
 
         result = pipe(
             prompt=prompt,
@@ -243,78 +622,332 @@ def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
             guidance_scale=GUIDANCE_SCALE,
             callback_on_step_end=step_callback,
         )
+
         frames = result.frames[0]
 
-        update_status(gpu_id, stage="encoding_video", progress=100)
-        output_path = f"/kaggle/working/{output_filename}.mp4"
-        export_to_video(frames, output_video_path=output_path, fps=FPS)
+        # -------------------------------------------------------
+        # Encode MP4
+        # -------------------------------------------------------
 
-        result_dict[f"{gpu_id}_file"] = output_path
+        update_status(
+            gpu_id,
+            stage="encoding_video",
+            progress=100,
+        )
+
+        output_path = (
+            f"/kaggle/working/"
+            f"{output_filename}.mp4"
+        )
+
+        export_to_video(
+            frames,
+            output_video_path=output_path,
+            fps=FPS,
+        )
+
+        result_dict[
+            f"{gpu_id}_file"
+        ] = output_path
+
+        # -------------------------------------------------------
+        # Optional distributed hand-off
+        # -------------------------------------------------------
 
         if _queue:
-            update_status(gpu_id, stage="submitting_to_queue")
-            job_id = _queue.submit_job(prompt=prompt, video_local_path=output_path)
-            result_dict[f"{gpu_id}_job_id"] = job_id
 
-        update_status(gpu_id, stage="done", progress=100)
+            update_status(
+                gpu_id,
+                stage="submitting_to_queue",
+                progress=100,
+            )
+
+            job_id = _queue.submit_job(
+                prompt=prompt,
+                video_local_path=output_path,
+            )
+
+            result_dict[
+                f"{gpu_id}_job_id"
+            ] = job_id
+
+        # -------------------------------------------------------
+        # Complete
+        # -------------------------------------------------------
+
+        update_status(
+            gpu_id,
+            stage="done",
+            progress=100,
+        )
+
     except Exception as e:
-        result_dict[f"{gpu_id}_error"] = str(e)
-        update_status(gpu_id, stage=f"error: {e}", progress=0)
+
+        result_dict[
+            f"{gpu_id}_error"
+        ] = str(e)
+
+        update_status(
+            gpu_id,
+            stage=f"error: {e}",
+            progress=0,
+        )
+
+        print(
+            f"[GPU {gpu_id} ERROR] {e}"
+        )
+
     finally:
+
         stop_event.set()
-        hb_thread.join(timeout=HEARTBEAT_INTERVAL + 1)
+
+        heartbeat_thread.join(
+            timeout=HEARTBEAT_INTERVAL + 1
+        )
 
 
-def orchestrator(prompt_left, prompt_right, progress=gr.Progress()):
+# ===============================================================
+# Orchestrator
+# ===============================================================
+
+def orchestrator(
+    prompt_left,
+    prompt_right,
+    progress=gr.Progress(),
+):
+
     result = {}
 
-    t1 = threading.Thread(target=render_on_gpu, args=(prompt_left, 0, "raw_asset_gpu0", result))
-    t2 = threading.Thread(target=render_on_gpu, args=(prompt_right, 1, "raw_asset_gpu1", result))
-    t1.start()
-    t2.start()
+    # -----------------------------------------------------------
+    # GPU 0
+    # -----------------------------------------------------------
 
-    while t1.is_alive() or t2.is_alive():
-        s = read_status()
-        avg = (s[0]["progress"] + s[1]["progress"]) / 200.0
-        progress(avg, desc=format_status_text().replace("\n", " | "))
-        t1.join(timeout=0.5)
-        t2.join(timeout=0.5)
+    thread_gpu0 = threading.Thread(
+        target=render_on_gpu,
+        args=(
+            prompt_left,
+            0,
+            "raw_asset_gpu0",
+            result,
+        ),
+        name="render-gpu0",
+    )
 
-    err0, err1 = result.get("0_error"), result.get("1_error")
-    if err0:
-        print(f"[GPU 0 ERROR] {err0}")
-    if err1:
-        print(f"[GPU 1 ERROR] {err1}")
+    # -----------------------------------------------------------
+    # GPU 1
+    # -----------------------------------------------------------
 
-    return result.get("0_file"), result.get("1_file")
+    thread_gpu1 = threading.Thread(
+        target=render_on_gpu,
+        args=(
+            prompt_right,
+            1,
+            "raw_asset_gpu1",
+            result,
+        ),
+        name="render-gpu1",
+    )
+
+    # -----------------------------------------------------------
+    # Start both
+    # -----------------------------------------------------------
+
+    thread_gpu0.start()
+    thread_gpu1.start()
+
+    # -----------------------------------------------------------
+    # Monitor progress
+    # -----------------------------------------------------------
+
+    while (
+        thread_gpu0.is_alive()
+        or thread_gpu1.is_alive()
+    ):
+
+        status = read_status()
+
+        avg_progress = (
+            status[0]["progress"]
+            + status[1]["progress"]
+        ) / 200.0
+
+        progress(
+            avg_progress,
+            desc=format_status_text().replace(
+                "\n",
+                " | ",
+            ),
+        )
+
+        thread_gpu0.join(
+            timeout=0.5
+        )
+
+        thread_gpu1.join(
+            timeout=0.5
+        )
+
+    # -----------------------------------------------------------
+    # Errors
+    # -----------------------------------------------------------
+
+    error_gpu0 = result.get(
+        "0_error"
+    )
+
+    error_gpu1 = result.get(
+        "1_error"
+    )
+
+    if error_gpu0:
+
+        print(
+            f"[GPU 0 ERROR] "
+            f"{error_gpu0}"
+        )
+
+    if error_gpu1:
+
+        print(
+            f"[GPU 1 ERROR] "
+            f"{error_gpu1}"
+        )
+
+    # -----------------------------------------------------------
+    # Return videos
+    # -----------------------------------------------------------
+
+    return (
+        result.get("0_file"),
+        result.get("1_file"),
+    )
 
 
-# ------------------------------------------------------------------
-# UI
-# ------------------------------------------------------------------
-with gr.Blocks(theme=gr.themes.Glass()) as app:
-    gr.Markdown("# Dual-GPU Parallel Video Production Studio")
+# ===============================================================
+# Gradio UI
+# ===============================================================
 
-    status_box = gr.Textbox(label="Live GPU Status", value=format_status_text, lines=3)
-    app.load(fn=format_status_text, outputs=status_box, every=HEARTBEAT_INTERVAL)
+with gr.Blocks(
+    theme=gr.themes.Glass()
+) as app:
+
+    gr.Markdown(
+        "# Dual-GPU Parallel Video Production Studio"
+    )
+
+    # -----------------------------------------------------------
+    # Live status
+    # -----------------------------------------------------------
+
+    status_box = gr.Textbox(
+        label="Live GPU Status",
+        value=format_status_text(),
+        lines=3,
+    )
+
+    # -----------------------------------------------------------
+    # Modern Gradio timer
+    # -----------------------------------------------------------
+
+    status_timer = gr.Timer(
+        value=HEARTBEAT_INTERVAL
+    )
+
+    status_timer.tick(
+        fn=format_status_text,
+        outputs=status_box,
+    )
+
+    # -----------------------------------------------------------
+    # Prompt inputs
+    # -----------------------------------------------------------
 
     with gr.Row():
+
         with gr.Column():
+
             p0_box = gr.Textbox(
                 label="Prompt for GPU 0",
-                value="Vector sticker of an astronaut, whiteboard background, flat design",
+                value=(
+                    "Vector sticker of an astronaut, "
+                    "whiteboard background, "
+                    "flat design"
+                ),
             )
+
             p1_box = gr.Textbox(
                 label="Prompt for GPU 1",
-                value="Vector sticker of a rocket ship, whiteboard background, flat design",
+                value=(
+                    "Vector sticker of a rocket ship, "
+                    "whiteboard background, "
+                    "flat design"
+                ),
             )
-            btn = gr.Button("Run Dual Render Loop", variant="primary")
-        with gr.Column():
-            out0 = gr.Video(label="Output GPU 0")
-            out1 = gr.Video(label="Output GPU 1")
 
-    btn.click(fn=orchestrator, inputs=[p0_box, p1_box], outputs=[out0, out1])
+            btn = gr.Button(
+                "Run Dual Render Loop",
+                variant="primary",
+            )
+
+        # -------------------------------------------------------
+        # Output videos
+        # -------------------------------------------------------
+
+        with gr.Column():
+
+            out0 = gr.Video(
+                label="Output GPU 0"
+            )
+
+            out1 = gr.Video(
+                label="Output GPU 1"
+            )
+
+    # -----------------------------------------------------------
+    # Button action
+    # -----------------------------------------------------------
+
+    btn.click(
+        fn=orchestrator,
+        inputs=[
+            p0_box,
+            p1_box,
+        ],
+        outputs=[
+            out0,
+            out1,
+        ],
+    )
+
+
+# ===============================================================
+# Main
+# ===============================================================
 
 if __name__ == "__main__":
-    ensure_pipelines_ready()  # parallel download+load before serving any request
-    app.launch(share=True)
+
+    print("")
+    print(
+        "================================================"
+    )
+    print(
+        " Starting Universal Documentary Studio"
+    )
+    print(
+        "================================================"
+    )
+    print("")
+
+    # -----------------------------------------------------------
+    # Prepare both GPUs before serving UI
+    # -----------------------------------------------------------
+
+    ensure_pipelines_ready()
+
+    # -----------------------------------------------------------
+    # Launch Gradio
+    # -----------------------------------------------------------
+
+    app.launch(
+        share=True
+    )
