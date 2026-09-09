@@ -37,8 +37,27 @@ from diffusers import CogVideoXPipeline
 from diffusers.utils import export_to_video
 from huggingface_hub import snapshot_download
 
+try:
+    from distributed_queue import Queue
+except ImportError:
+    Queue = None  # distributed mode is optional; local-only mode still works
+
+# Fill these in to enable distributed mode (see distributed_queue.py's
+# module docstring for the one-time Google Cloud + Drive setup). Leave
+# SERVICE_ACCOUNT_JSON as None to run in local-only mode, unchanged
+# from before, with no Colab hand-off.
+SERVICE_ACCOUNT_JSON = None  # e.g. "/kaggle/working/service_account.json"
+DRIVE_ROOT_FOLDER_ID = None  # e.g. "1AbCdEfGhIjKlMnOpQrSt"
+
+_queue = None
+if Queue and SERVICE_ACCOUNT_JSON and DRIVE_ROOT_FOLDER_ID:
+    _queue = Queue(SERVICE_ACCOUNT_JSON, DRIVE_ROOT_FOLDER_ID)
+    print("Distributed queue connected — renders will be handed off to Colab workers.")
+else:
+    print("Running in local-only mode (no distributed queue configured).")
+
 MODEL_ID = "THUDM/CogVideoX-2b"
-NUM_FRAMES = 49  # ~6s at 8fps
+NUM_FRAMES = 49          # ~6s at 8fps
 NUM_STEPS = 50
 GUIDANCE_SCALE = 6.5
 FPS = 8
@@ -57,8 +76,9 @@ _status = {
 
 def update_status(gpu_id, **fields):
     """Merge fields into this GPU's status, stamp the heartbeat, and
-    persist to disk so any process/tab reading STATUS_FILE sees the
-    latest known state even after a disconnect/reconnect."""
+    persist to disk (and to the shared queue, if configured) so any
+    process/tab/Colab worker reading current state sees it even after
+    a disconnect/reconnect."""
     with _status_lock:
         _status[gpu_id].update(fields)
         _status[gpu_id]["last_heartbeat"] = time.time()
@@ -68,15 +88,23 @@ def update_status(gpu_id, **fields):
             json.dump(snapshot, f)
     except OSError:
         pass  # disk hiccup shouldn't kill the worker
+    if _queue:
+        try:
+            _queue.report_heartbeat(
+                node_id=f"kaggle-gpu{gpu_id}",
+                role="kaggle-generator",
+                stage=snapshot[gpu_id]["stage"],
+                progress=snapshot[gpu_id]["progress"],
+                extra={"prompt": snapshot[gpu_id]["prompt"]},
+            )
+        except Exception as e:
+            print(f"[queue heartbeat warning] {e}")
     return snapshot
 
 
 def read_status():
     with _status_lock:
-        return {
-            0: dict(_status[0]),
-            1: dict(_status[1]),
-        }
+        return json.loads(json.dumps(_status))
 
 
 def format_status_text():
@@ -89,13 +117,25 @@ def format_status_text():
             age_str = "never"
         else:
             age = now - hb
-            age_str = f"{age:.1f}s ago" + (
-                "  [STALE]" if age > HEARTBEAT_INTERVAL * 4 else ""
-            )
+            age_str = f"{age:.1f}s ago" + ("  [STALE]" if age > HEARTBEAT_INTERVAL * 4 else "")
         prompt_str = f' — "{s["prompt"]}"' if s.get("prompt") else ""
         lines.append(
             f"GPU {gpu_id}: {s['stage']} ({s['progress']}%) — last heartbeat {age_str}{prompt_str}"
         )
+
+    if _queue:
+        try:
+            for node_id, s in sorted(_queue.list_all_status().items()):
+                if node_id.startswith("kaggle-gpu"):
+                    continue  # already shown above from local state
+                flag = "  [STALE]" if s["stale"] else ""
+                lines.append(
+                    f"{node_id} ({s['role']}): {s['stage']} "
+                    f"({s.get('progress')}) — last heartbeat {s['age_seconds']}s ago{flag}"
+                )
+        except Exception as e:
+            lines.append(f"[queue status unavailable: {e}]")
+
     return "\n".join(lines)
 
 
@@ -127,9 +167,7 @@ def _ensure_downloaded(gpu_id):
     locally; only hit the hub if something's missing."""
     update_status(gpu_id, stage="checking_cache")
     try:
-        snapshot_download(
-            repo_id=MODEL_ID, cache_dir="/tmp/hf_cache", local_files_only=True
-        )
+        snapshot_download(repo_id=MODEL_ID, cache_dir="/tmp/hf_cache", local_files_only=True)
         update_status(gpu_id, stage="cache_hit")
         return
     except Exception:
@@ -187,9 +225,7 @@ def ensure_pipelines_ready():
 # ------------------------------------------------------------------
 def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
     stop_event = threading.Event()
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(gpu_id, stop_event), daemon=True
-    )
+    hb_thread = threading.Thread(target=_heartbeat_loop, args=(gpu_id, stop_event), daemon=True)
     hb_thread.start()
 
     try:
@@ -197,9 +233,7 @@ def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
         update_status(gpu_id, stage="generating", progress=0, prompt=prompt)
 
         def step_callback(pipeline, step, timestep, callback_kwargs):
-            update_status(
-                gpu_id, stage="generating", progress=int((step / NUM_STEPS) * 100)
-            )
+            update_status(gpu_id, stage="generating", progress=int((step / NUM_STEPS) * 100))
             return callback_kwargs
 
         result = pipe(
@@ -216,6 +250,12 @@ def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
         export_to_video(frames, output_video_path=output_path, fps=FPS)
 
         result_dict[f"{gpu_id}_file"] = output_path
+
+        if _queue:
+            update_status(gpu_id, stage="submitting_to_queue")
+            job_id = _queue.submit_job(prompt=prompt, video_local_path=output_path)
+            result_dict[f"{gpu_id}_job_id"] = job_id
+
         update_status(gpu_id, stage="done", progress=100)
     except Exception as e:
         result_dict[f"{gpu_id}_error"] = str(e)
@@ -228,12 +268,8 @@ def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
 def orchestrator(prompt_left, prompt_right, progress=gr.Progress()):
     result = {}
 
-    t1 = threading.Thread(
-        target=render_on_gpu, args=(prompt_left, 0, "raw_asset_gpu0", result)
-    )
-    t2 = threading.Thread(
-        target=render_on_gpu, args=(prompt_right, 1, "raw_asset_gpu1", result)
-    )
+    t1 = threading.Thread(target=render_on_gpu, args=(prompt_left, 0, "raw_asset_gpu0", result))
+    t2 = threading.Thread(target=render_on_gpu, args=(prompt_right, 1, "raw_asset_gpu1", result))
     t1.start()
     t2.start()
 
@@ -259,18 +295,8 @@ def orchestrator(prompt_left, prompt_right, progress=gr.Progress()):
 with gr.Blocks(theme=gr.themes.Glass()) as app:
     gr.Markdown("# Dual-GPU Parallel Video Production Studio")
 
-    status_box = gr.Textbox(
-        label="Live GPU Status",
-        value=format_status_text(),
-        lines=3,
-    )
-
-    status_timer = gr.Timer(value=HEARTBEAT_INTERVAL)
-
-    status_timer.tick(
-        fn=format_status_text,
-        outputs=status_box,
-    )
+    status_box = gr.Textbox(label="Live GPU Status", value=format_status_text, lines=3)
+    app.load(fn=format_status_text, outputs=status_box, every=HEARTBEAT_INTERVAL)
 
     with gr.Row():
         with gr.Column():

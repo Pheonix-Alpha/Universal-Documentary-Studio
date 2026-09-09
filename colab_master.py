@@ -25,10 +25,26 @@ Run setup_colab.sh once first to fetch weights (also idempotent).
 
 import json
 import os
+import sys
 import time
+import types
 
 import cv2
 import torch
+
+# basicsr (a realesrgan dependency, unmaintained since 2022) imports
+# torchvision.transforms.functional_tensor, which modern torchvision
+# removed. Shim it in before basicsr/realesrgan get imported, or this
+# crashes with ModuleNotFoundError even after a successful pip install.
+try:
+    import torchvision.transforms.functional_tensor  # noqa: F401
+except ModuleNotFoundError:
+    import torchvision.transforms.functional as _tvf
+
+    _shim = types.ModuleType("torchvision.transforms.functional_tensor")
+    _shim.rgb_to_grayscale = _tvf.rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = _shim
+
 import numpy as np
 import torch.nn.functional as F
 from realesrgan import RealESRGANer

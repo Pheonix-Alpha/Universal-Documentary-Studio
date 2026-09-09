@@ -64,6 +64,59 @@ Notes:
    stage, `frames_done/total_frames`, and heartbeat age, so you know
    whether to keep waiting or the job actually died.
 
+## Fixing the Real-ESRGAN install error
+`pip install basicsr realesrgan` fails on current Colab/Kaggle images
+with `egg_info did not run successfully` because `basicsr`'s old-style
+`setup.py` needs `torch` visible inside pip's isolated build
+environment, which it isn't by default. Even once that's fixed, its
+code imports `torchvision.transforms.functional_tensor`, which modern
+torchvision removed. `setup_colab.sh` now installs torch first, uses
+`--no-build-isolation`, and `colab_master.py` shims the missing module
+back in before importing `basicsr`/`realesrgan`. If you still hit
+errors, re-run `setup_colab.sh` after a fresh runtime restart rather
+than on top of a half-installed environment.
+
+## Running Kaggle + any number of Colabs as one system
+`distributed_queue.py` is a shared module (paste the identical file
+into the Kaggle notebook and into every Colab worker notebook) that
+uses a Google Drive folder as a job queue and a heartbeat board, since
+Kaggle and Colab can't reach each other directly.
+
+**One-time setup:**
+1. Google Cloud Console -> create a service account -> download its JSON key.
+2. Create a Drive folder, share it with the service account's email (Editor access).
+3. Copy the folder ID from its URL.
+4. Upload the JSON key into each notebook session (as a secret/private file, never public).
+5. In `app_production.py`, set `SERVICE_ACCOUNT_JSON` and `DRIVE_ROOT_FOLDER_ID` at the top.
+6. In `colab_worker.py`, set the same two values.
+
+**Running it:**
+- Start `app_production.py` on Kaggle as usual. Every finished render
+  is now also pushed to the shared `pending/` queue automatically.
+- Start `colab_worker.py` in one Colab notebook. It claims jobs, masters
+  them, and uploads results to `done/` — no manual copying between
+  platforms needed.
+- Open a second (or third, fourth...) Colab notebook and run the exact
+  same `colab_worker.py`. Each picks its own random worker ID and pulls
+  from the same queue — more workers just means more jobs processed in
+  parallel, with zero code changes.
+- The Kaggle Gradio status panel merges local GPU status with every
+  Colab worker's heartbeat, so one screen shows the whole system:
+  which GPU is generating what, which Colab is mastering which job,
+  and which nodes have gone stale.
+
+**Leave `SERVICE_ACCOUNT_JSON = None`** in `app_production.py` to keep
+running Kaggle standalone with no distributed hand-off — nothing else
+changes.
+
+**Honest limitation:** job claiming uses an optimistic rename-and-verify
+check, not a real database transaction. It's fine for a handful of
+cooperating workers; if two happen to poll at the exact same instant,
+the loser just retries next cycle rather than double-processing. It
+is not built to survive adversarial or very high-concurrency use — if
+you need that guarantee, put a real transactional store (e.g.
+Firestore) behind the same interface instead of raw Drive files.
+
 ## What's fixed vs. earlier drafts
 - Two isolated pipeline instances, each pinned to its own GPU via
   per-instance `gpu_id` offload — no shared-pipe device collision.
