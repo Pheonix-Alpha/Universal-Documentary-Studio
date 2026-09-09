@@ -50,9 +50,26 @@ os.makedirs("/tmp/hf_cache", exist_ok=True)
 # 2. Load two isolated pipelines, one per GPU (loaded once, stay resident)
 # ---------------------------------------------------------------------------
 print("[init] Loading independent GPU memory contexts...")
-pipe_0 = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b", torch_dtype=torch.float16).to("cuda:0")
-pipe_1 = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b", torch_dtype=torch.float16).to("cuda:1")
-print("[init] Both pipelines resident in VRAM.")
+pipe_0 = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b", torch_dtype=torch.float16)
+pipe_1 = CogVideoXPipeline.from_pretrained("THUDM/CogVideoX-2b", torch_dtype=torch.float16)
+
+# CogVideoX-2b's fp16 footprint (~13-14GB) leaves almost no headroom on a
+# ~14.5GB T4 -- a plain .to("cuda") OOMs during the weight copy itself,
+# before generation even starts. enable_model_cpu_offload keeps only the
+# submodule that's actively running resident on its GPU and swaps the rest
+# to CPU RAM, which comfortably fits with modest per-step overhead.
+# gpu_id pins each pipeline's offload traffic to its own isolated device,
+# so the two pipelines never contend for the same GPU (this is per-pipe,
+# not the shared/global offload hook the spec warns against).
+pipe_0.enable_model_cpu_offload(gpu_id=0)
+pipe_1.enable_model_cpu_offload(gpu_id=1)
+
+# Extra safety margin: VAE decode briefly spikes memory materializing all
+# 49 frames at once.
+pipe_0.vae.enable_tiling()
+pipe_1.vae.enable_tiling()
+
+print("[init] Both pipelines configured for isolated per-GPU offload.")
 
 _status = {0: 0, 1: 0, "busy": False}
 
