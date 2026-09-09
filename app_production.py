@@ -38,7 +38,7 @@ from diffusers.utils import export_to_video
 from huggingface_hub import snapshot_download
 
 MODEL_ID = "THUDM/CogVideoX-2b"
-NUM_FRAMES = 49          # ~6s at 8fps
+NUM_FRAMES = 49  # ~6s at 8fps
 NUM_STEPS = 50
 GUIDANCE_SCALE = 6.5
 FPS = 8
@@ -89,7 +89,9 @@ def format_status_text():
             age_str = "never"
         else:
             age = now - hb
-            age_str = f"{age:.1f}s ago" + ("  [STALE]" if age > HEARTBEAT_INTERVAL * 4 else "")
+            age_str = f"{age:.1f}s ago" + (
+                "  [STALE]" if age > HEARTBEAT_INTERVAL * 4 else ""
+            )
         prompt_str = f' — "{s["prompt"]}"' if s.get("prompt") else ""
         lines.append(
             f"GPU {gpu_id}: {s['stage']} ({s['progress']}%) — last heartbeat {age_str}{prompt_str}"
@@ -125,7 +127,9 @@ def _ensure_downloaded(gpu_id):
     locally; only hit the hub if something's missing."""
     update_status(gpu_id, stage="checking_cache")
     try:
-        snapshot_download(repo_id=MODEL_ID, cache_dir="/tmp/hf_cache", local_files_only=True)
+        snapshot_download(
+            repo_id=MODEL_ID, cache_dir="/tmp/hf_cache", local_files_only=True
+        )
         update_status(gpu_id, stage="cache_hit")
         return
     except Exception:
@@ -183,7 +187,9 @@ def ensure_pipelines_ready():
 # ------------------------------------------------------------------
 def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
     stop_event = threading.Event()
-    hb_thread = threading.Thread(target=_heartbeat_loop, args=(gpu_id, stop_event), daemon=True)
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(gpu_id, stop_event), daemon=True
+    )
     hb_thread.start()
 
     try:
@@ -191,7 +197,9 @@ def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
         update_status(gpu_id, stage="generating", progress=0, prompt=prompt)
 
         def step_callback(pipeline, step, timestep, callback_kwargs):
-            update_status(gpu_id, stage="generating", progress=int((step / NUM_STEPS) * 100))
+            update_status(
+                gpu_id, stage="generating", progress=int((step / NUM_STEPS) * 100)
+            )
             return callback_kwargs
 
         result = pipe(
@@ -220,8 +228,12 @@ def render_on_gpu(prompt, gpu_id, output_filename, result_dict):
 def orchestrator(prompt_left, prompt_right, progress=gr.Progress()):
     result = {}
 
-    t1 = threading.Thread(target=render_on_gpu, args=(prompt_left, 0, "raw_asset_gpu0", result))
-    t2 = threading.Thread(target=render_on_gpu, args=(prompt_right, 1, "raw_asset_gpu1", result))
+    t1 = threading.Thread(
+        target=render_on_gpu, args=(prompt_left, 0, "raw_asset_gpu0", result)
+    )
+    t2 = threading.Thread(
+        target=render_on_gpu, args=(prompt_right, 1, "raw_asset_gpu1", result)
+    )
     t1.start()
     t2.start()
 
@@ -247,8 +259,18 @@ def orchestrator(prompt_left, prompt_right, progress=gr.Progress()):
 with gr.Blocks(theme=gr.themes.Glass()) as app:
     gr.Markdown("# Dual-GPU Parallel Video Production Studio")
 
-    status_box = gr.Textbox(label="Live GPU Status", value=format_status_text, lines=3)
-    app.load(fn=format_status_text, outputs=status_box, every=HEARTBEAT_INTERVAL)
+    status_box = gr.Textbox(
+        label="Live GPU Status",
+        value=format_status_text(),
+        lines=3,
+    )
+
+    status_timer = gr.Timer(value=HEARTBEAT_INTERVAL)
+
+    status_timer.tick(
+        fn=format_status_text,
+        outputs=status_box,
+    )
 
     with gr.Row():
         with gr.Column():
