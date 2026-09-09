@@ -1,77 +1,134 @@
 """
-colab_worker.py
-=================
-Run this in as many Colab notebooks as you want. Each one:
-  - picks its own unique worker_id
-  - loops: claim a job from the shared queue -> master it -> upload
-    the result -> report heartbeats the whole time
-  - if no job is pending, reports "idle, waiting" and polls again
-
-There is no coordination needed between Colab instances beyond the
-shared Drive folder — starting a second, third, fourth notebook with
-this same script just adds another puller against the same queue.
-Two workers will occasionally race for the same job (see
-distributed_queue.py's docstring on the optimistic-claim limitation);
-the loser just moves on to poll again, it doesn't crash or duplicate
-output.
-
-Prerequisites: run setup_colab.sh first, and fill in the service
-account JSON path + Drive folder ID below (same ones used in the
-Kaggle notebook).
+Colab Worker: HD Mastering Core (Real-ESRGAN x4 + RIFE interpolation)
+======================================================================
+This module is imported by colab_main.py -- it is not meant to be run
+directly. Call load_models() once, then process_and_upscale_stream()
+for each raw clip you want mastered.
 """
 
-import time
-import uuid
+import os
+import sys
+import subprocess
 
-from colab_master import process_and_upscale_stream
-from distributed_queue import Queue
-
-SERVICE_ACCOUNT_JSON = "/content/service_account.json"
-DRIVE_ROOT_FOLDER_ID = "PASTE_YOUR_FOLDER_ID_HERE"
-
-POLL_INTERVAL = 5  # seconds between queue checks when idle
-WORKER_ID = f"colab-worker-{uuid.uuid4().hex[:6]}"
+REQUIRED_PIP = ["opencv-python", "basicsr", "realesrgan", "numpy"]
 
 
-def run_forever():
-    q = Queue(SERVICE_ACCOUNT_JSON, DRIVE_ROOT_FOLDER_ID)
-    print(f"{WORKER_ID} online. Polling shared queue every {POLL_INTERVAL}s.")
+def ensure_requirements():
+    marker = "/content/.worker_deps_installed"
+    if os.path.exists(marker):
+        print("[setup] Worker deps already installed, skipping.")
+    else:
+        print("[setup] Installing colab_worker dependencies...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *REQUIRED_PIP], check=True)
+        with open(marker, "w") as f:
+            f.write("ok")
+        print("[setup] Done.")
 
-    while True:
-        q.report_heartbeat(WORKER_ID, role="colab-mastering", stage="polling", progress=None)
-        job = None
-        try:
-            job = q.claim_next_job(WORKER_ID)
-        except Exception as e:
-            print(f"[{WORKER_ID}] claim error: {e}")
+    # RIFE inference code + weights aren't on pip -- clone once, reused after.
+    if not os.path.exists("/content/ECCV2022-RIFE"):
+        print("[setup] Cloning RIFE (frame interpolation) repo...")
+        subprocess.run(
+            ["git", "clone", "--depth", "1",
+             "https://github.com/megvii-research/ECCV2022-RIFE",
+             "/content/ECCV2022-RIFE"],
+            check=True,
+        )
+    if "/content/ECCV2022-RIFE" not in sys.path:
+        sys.path.insert(0, "/content/ECCV2022-RIFE")
 
-        if job is None:
-            time.sleep(POLL_INTERVAL)
-            continue
 
-        print(f"[{WORKER_ID}] claimed job {job['job_id']} — prompt: {job.get('prompt')!r}")
-        q.report_heartbeat(
-            WORKER_ID, role="colab-mastering", stage="processing_job",
-            progress=0, extra={"job_id": job["job_id"]},
+ensure_requirements()
+
+import cv2
+import torch
+import numpy as np
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
+
+_MODELS = {"upsampler": None, "rife": None}
+
+
+def load_models(esrgan_weights_path="RealESRGAN_x4plus.pth", rife_dir="/content/ECCV2022-RIFE/train_log"):
+    """Load Real-ESRGAN + RIFE into VRAM exactly once and keep them resident."""
+    if _MODELS["upsampler"] is not None:
+        print("[models] Already loaded, skipping.")
+        return
+
+    if not os.path.exists(esrgan_weights_path):
+        print("[models] Fetching RealESRGAN_x4plus.pth ...")
+        subprocess.run(
+            ["wget", "-q",
+             "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+             "-O", esrgan_weights_path],
+            check=True,
         )
 
-        input_path = job.get("_local_video_path")
-        output_path = f"/tmp/{job['job_id']}_master.mp4"
-        try:
-            process_and_upscale_stream(input_path, output_path)
-            q.complete_job(job, output_path)
-            q.report_heartbeat(
-                WORKER_ID, role="colab-mastering", stage="job_done",
-                progress=100, extra={"job_id": job["job_id"]},
-            )
-            print(f"[{WORKER_ID}] finished job {job['job_id']}")
-        except Exception as e:
-            q.report_heartbeat(
-                WORKER_ID, role="colab-mastering", stage=f"job_error: {e}",
-                progress=0, extra={"job_id": job["job_id"]},
-            )
-            print(f"[{WORKER_ID}] job {job['job_id']} failed: {e}")
+    model_arch = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+    _MODELS["upsampler"] = RealESRGANer(
+        scale=4, model_path=esrgan_weights_path, model=model_arch, tile=400, half=True
+    )
+
+    from train_log.RIFE_HDv3 import Model as RIFEModel
+    rife_model = RIFEModel()
+    rife_model.load_model(rife_dir, -1)
+    rife_model.eval()
+    rife_model.device()
+    _MODELS["rife"] = rife_model
+    print("[models] Real-ESRGAN + RIFE resident in VRAM.")
 
 
-if __name__ == "__main__":
-    run_forever()
+def process_and_upscale_stream(input_path, output_path, target_size=(1920, 1080), target_fps=24):
+    """
+    Streams frame-by-frame: pads 3:2 -> 16:9, upscales x4, interpolates
+    8fps -> 24fps with RIFE, writes directly to disk (no RAM frame cache).
+    """
+    if _MODELS["upsampler"] is None or _MODELS["rife"] is None:
+        raise RuntimeError("Call load_models() before process_and_upscale_stream().")
+
+    upsampler = _MODELS["upsampler"]
+    rife_model = _MODELS["rife"]
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        raise IOError(f"Could not open input video: {input_path}")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, target_fps, target_size)
+
+    prev_frame_upscaled = None
+    success, frame = cap.read()
+    print(f"[process] Streaming {input_path} -> {output_path} ...")
+
+    while success:
+        h, w, _ = frame.shape
+        target_w = int(h * (16 / 9))
+        pad_w = max((target_w - w) // 2, 0)
+        padded_frame = cv2.copyMakeBorder(frame, 0, 0, pad_w, pad_w, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+
+        rgb_img = cv2.cvtColor(padded_frame, cv2.COLOR_BGR2RGB)
+        upscaled, _ = upsampler.enhance(rgb_img, outscale=4.0)
+        current_frame_hd = cv2.resize(upscaled, target_size, interpolation=cv2.INTER_LANCZOS4)
+
+        if prev_frame_upscaled is not None:
+            t0 = torch.from_numpy(prev_frame_upscaled.transpose(2, 0, 1)).to("cuda").float().unsqueeze(0) / 255.0
+            t1 = torch.from_numpy(current_frame_hd.transpose(2, 0, 1)).to("cuda").float().unsqueeze(0) / 255.0
+
+            mid1 = rife_model.inference(t0, t1, timestep=0.33)
+            mid2 = rife_model.inference(t0, t1, timestep=0.66)
+
+            f1 = (mid1[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+            f2 = (mid2[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+
+            out.write(cv2.cvtColor(prev_frame_upscaled, cv2.COLOR_RGB2BGR))
+            out.write(cv2.cvtColor(f1, cv2.COLOR_RGB2BGR))
+            out.write(cv2.cvtColor(f2, cv2.COLOR_RGB2BGR))
+
+        prev_frame_upscaled = current_frame_hd
+        success, frame = cap.read()
+
+    if prev_frame_upscaled is not None:
+        out.write(cv2.cvtColor(prev_frame_upscaled, cv2.COLOR_RGB2BGR))
+
+    cap.release()
+    out.release()
+    print(f"[process] Done -> {output_path}")
