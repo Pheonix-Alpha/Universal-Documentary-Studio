@@ -31,8 +31,9 @@ def ensure_requirements():
     else:
         print("[setup] Installing colab_worker dependencies...")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", *PLAIN_PIP], check=True)
+        print("[setup] Installing basicsr/realesrgan (verbose, so real errors are visible)...")
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q",
+            [sys.executable, "-m", "pip", "install",
              "--no-build-isolation", "--no-deps", *TORCH_DEPENDENT_PIP],
             check=True,
         )
